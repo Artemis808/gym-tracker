@@ -122,7 +122,10 @@ const store = {
   },
   async set(k, v) {
     if (_fbDb) {
-      try { await dbSet(dbRef(_fbDb, _fbKey(k)), v === undefined ? null : v); }
+      try {
+        const clean = v === undefined ? null : JSON.parse(JSON.stringify(v)); // strips undefined props (Firebase rejects them)
+        await dbSet(dbRef(_fbDb, _fbKey(k)), clean);
+      }
       catch (e) { SyncBus.set('error', e.message); }
       return;
     }
@@ -162,6 +165,12 @@ const fmtDate = (ts) => new Date(ts).toLocaleDateString(undefined, { weekday: 's
 
 const vol = (w) => !w?.exercises ? 0 : w.exercises.reduce((s, ex) => s + ex.sets.filter(x => x.done).reduce((a, x) => a + (+x.w || 0) * (+x.r || 0), 0), 0);
 const setCount = (w) => !w?.exercises ? 0 : w.exercises.reduce((n, ex) => n + ex.sets.filter(x => x.done).length, 0);
+
+// Firebase Realtime DB strips empty arrays — these restore expected shapes after reads.
+const normEx = (ex) => ({ ...ex, sets: ex.sets || [], sm: ex.sm || [] });
+const normActive = (a) => a ? { ...a, exercises: (a.exercises || []).map(normEx) } : null;
+const normHistory = (h) => (h || []).map(w => ({ ...w, exercises: (w.exercises || []).map(normEx) }));
+const normTemplates = (t) => (t || []).map(x => ({ ...x, exercises: x.exercises || [] }));
 
 // Epley estimated one-rep max
 const e1rm = (w, r) => { w = Number(w) || 0; r = Number(r) || 0; if (!w || !r) return 0; return r === 1 ? w : w * (1 + r / 30); };
@@ -449,7 +458,7 @@ function BodyMap({ view, heat, onSelect }) {
 /* ════════════════════════════════════════════════════════════════
    ROOT
 ═══════════════════════════════════════════════════════════════════ */
-export default function App() {
+function AppInner() {
   const [tab, setTab] = useState('body');
   const [history, setHistory] = useState([]);
   const [active, setActive] = useState(null);
@@ -476,7 +485,7 @@ export default function App() {
       store.get(K.settings, { unit: 'kg', rest: 90, wInc: 2.5, rInc: 1 }), store.get(K.rest, null),
       store.get(K.templates, []), store.get(K.weights, []),
     ]);
-    setHistory(h); setActive(a); setCustom(c); setSettings(s); setRestEnd(r); setTemplates(tp); setWeights(wt); setLoaded(true);
+    setHistory(normHistory(h)); setActive(normActive(a)); setCustom(c); setSettings(s); setRestEnd(r); setTemplates(normTemplates(tp)); setWeights(wt); setLoaded(true);
   })(); }, []);
 
   // Live cross-device sync: remote changes flow into local state.
@@ -484,21 +493,24 @@ export default function App() {
   // from what we last wrote/saw — this prevents a write→remote→read→write echo loop.
   useEffect(() => {
     if (!loaded) return;
-    const make = (key, setter, fb) => store.subscribe(key, (v) => {
-      const val = (v === null || v === undefined) ? fb : v;
+    const make = (key, setter, fb, norm) => store.subscribe(key, (v) => {
+      let val = (v === null || v === undefined) ? fb : v;
+      if (norm) val = norm(val);
       const ser = JSON.stringify(val);
       if (seen.current[key] === ser) return;   // no real change — skip
       seen.current[key] = ser;
       setter(val);
     }, fb);
+    // NOTE: the active workout and rest timer are intentionally NOT live-synced —
+    // they persist (and load on app start) so you can resume on another device,
+    // but live-merging every keystroke across devices would create input races.
+    // Finished workouts, templates, weights and settings sync live everywhere.
     const subs = [
-      make(K.history, setHistory, []),
-      make(K.active, setActive, null),
+      make(K.history, setHistory, [], normHistory),
       make(K.custom, setCustom, []),
       make(K.settings, (v) => v && setSettings(v), null),
-      make(K.templates, setTemplates, []),
+      make(K.templates, setTemplates, [], normTemplates),
       make(K.weights, setWeights, []),
-      make(K.rest, setRestEnd, null),
     ].filter(Boolean);
     return () => subs.forEach(u => u && u());
   }, [loaded]);
@@ -568,7 +580,7 @@ export default function App() {
   };
   const finish = () => {
     const done = { ...active, endTime: Date.now(),
-      exercises: active.exercises.map(ex => ({ ...ex, sets: ex.sets.filter(s => s.done && s.r) })).filter(ex => ex.sets.length) };
+      exercises: (active.exercises || []).map(ex => ({ ...ex, sets: (ex.sets || []).filter(s => s.done && s.r) })).filter(ex => ex.sets.length) };
     if (!done.exercises.length) { ask('No sets were completed. Discard this workout?', () => { setActive(null); setRestEnd(null); }); return; }
     setHistory(h => [...h, done]); setActive(null); setRestEnd(null); setTab('history');
   };
@@ -779,7 +791,7 @@ function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, onS
               <div key={t.id} style={{ ...S.card, display: 'flex', alignItems: 'center', gap: 10, padding: '12px 12px' }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 700, fontSize: 15 }}>{t.name}</div>
-                  <div style={{ fontSize: 11, color: T.textDim, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.exercises.map(e => e.n).join(' · ')}</div>
+                  <div style={{ fontSize: 11, color: T.textDim, marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{(t.exercises || []).map(e => e.n).join(' · ')}</div>
                 </div>
                 <button style={{ background: T.gold, color: '#000', border: 'none', borderRadius: 9, padding: '9px 14px', fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: FB }} onClick={() => onStartTemplate(t)}>Start</button>
                 <button style={{ ...S.iconBtn, color: T.textMute }} onClick={() => onDeleteTemplate(t.id)} aria-label="Delete template"><X size={16} /></button>
@@ -805,7 +817,7 @@ function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, onS
       </div>
 
       <div style={{ padding: '0 12px', display: 'flex', flexDirection: 'column', gap: 12, marginTop: 4 }}>
-        {active.exercises.map((ex, ei) => (
+        {(active.exercises || []).map((ex, ei) => (
           <ActiveExercise key={ex.key} ex={ex} settings={settings} prev={prevFor(ex.n)} prBase={prBaseline(ex.n)}
             onOpenDetail={() => onOpenDetail(ex)}
             onRemove={() => ask(`Remove ${ex.n} from this workout?`, () => onRemoveExercise(ei))}
@@ -879,7 +891,7 @@ function ActiveExercise({ ex, settings, prev, prBase, onOpenDetail, onRemove, on
         <span style={{ width: 38, textAlign: 'center' }}>✓</span>
       </div>
 
-      {ex.sets.map((s, si) => (
+      {(ex.sets || []).map((s, si) => (
         <SetRow key={s.id} n={si + 1} s={s} prev={prev?.[si]} isPR={s.done && e1rm(s.w, s.r) > prBase} unit={settings.unit}
           wInc={settings.wInc} rInc={settings.rInc}
           onChange={(p) => onUpdateSet(si, p)} onToggle={() => onToggle(si)}
@@ -1015,11 +1027,11 @@ function HistCard({ w, history, unit, onDelete, onRepeat }) {
       </button>
       {open && (
         <div style={{ borderTop: `1px solid ${T.border}`, padding: '6px 14px 12px' }} className="fade-in">
-          {w.exercises.map((ex, i) => (
+          {(w.exercises || []).map((ex, i) => (
             <div key={i} style={{ padding: '8px 0', borderTop: i ? `1px solid ${T.border}` : 'none' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><div style={{ fontSize: 14, fontWeight: 600 }}>{ex.n}</div>{prs.has(ex.n) && <span style={S.prPill}>PR</span>}</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 5 }}>
-                {ex.sets.map((s, j) => <span key={j} style={S.setPill}>{s.w || 0}×{s.r}</span>)}
+                {(ex.sets || []).map((s, j) => <span key={j} style={S.setPill}>{s.w || 0}×{s.r}</span>)}
               </div>
             </div>
           ))}
@@ -1622,3 +1634,35 @@ const S = {
   weightBtn: { width: 52, height: 52, borderRadius: 14, background: T.surfaceHi, border: `1px solid ${T.border}`, color: T.text, display: 'grid', placeItems: 'center', cursor: 'pointer' },
   prPill: { fontSize: 9, fontWeight: 800, letterSpacing: 0.5, background: T.gold, color: '#000', padding: '2px 6px', borderRadius: 5, marginLeft: 6 },
 };
+
+
+/* ════════════════════════════════════════════════════════════════
+   ERROR BOUNDARY — turns crashes into a recoverable screen.
+═══════════════════════════════════════════════════════════════════ */
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { err: null }; }
+  static getDerivedStateFromError(err) { return { err }; }
+  render() {
+    if (this.state.err) {
+      return (
+        <div style={{ minHeight: '100vh', background: '#000', color: '#f4f4f6', display: 'grid', placeItems: 'center', fontFamily: FB, padding: 24 }}>
+          <div style={{ textAlign: 'center', maxWidth: 360 }}>
+            <div style={{ fontSize: 18, fontWeight: 800, color: '#d4af37' }}>Something went wrong</div>
+            <div style={{ fontSize: 12.5, color: '#9aa0ab', margin: '10px 0 18px', lineHeight: 1.6, fontFamily: FM, wordBreak: 'break-word' }}>
+              {String((this.state.err && this.state.err.message) || this.state.err)}
+            </div>
+            <button onClick={() => window.location.reload()} style={{ background: 'linear-gradient(135deg, #e9d27c, #d4af37)', color: '#1a1405', border: 'none', borderRadius: 12, padding: '13px 26px', fontWeight: 800, fontSize: 14, cursor: 'pointer', fontFamily: FB }}>
+              Reload app
+            </button>
+            <div style={{ fontSize: 11, color: '#5b5e66', marginTop: 14 }}>Your data is safe — it lives in the database, not this screen.</div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function App() {
+  return <ErrorBoundary><AppInner /></ErrorBoundary>;
+}
