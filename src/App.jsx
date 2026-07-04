@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { PersonStanding, Dumbbell, History as HistoryIcon, BookOpen, Settings as SettingsIcon, MoreHorizontal, Check, Circle, Plus, Minus, ChevronRight, ChevronDown, ChevronLeft, X, Activity, RefreshCw, Cloud, CloudOff } from 'lucide-react';
+import { PersonStanding, Dumbbell, History as HistoryIcon, BookOpen, Settings as SettingsIcon, MoreHorizontal, Check, Circle, Plus, Minus, ChevronRight, ChevronDown, ChevronLeft, X, Activity, RefreshCw, Cloud, CloudOff, Anchor } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getDatabase, ref as dbRef, onValue, set as dbSet, goOnline } from 'firebase/database';
 import { firebaseConfig } from './firebase.js';
@@ -61,7 +61,7 @@ const REGION_LABEL = Object.fromEntries(REGIONS.map(r => [r.id, r.label]));
 /* ════════════════════════════════════════════════════════════════
    STORAGE
 ═══════════════════════════════════════════════════════════════════ */
-const K = { history: 'gymx:history', active: 'gymx:active', settings: 'gymx:settings', rest: 'gymx:rest', custom: 'gymx:custom', templates: 'gymx:templates', weights: 'gymx:weights', garmin: 'gymx:garmin' };
+const K = { history: 'gymx:history', active: 'gymx:active', settings: 'gymx:settings', rest: 'gymx:rest', custom: 'gymx:custom', templates: 'gymx:templates', weights: 'gymx:weights', garmin: 'gymx:garmin', program: 'gymx:program', schema: 'gymx:schema' };
 /* ────────────────────────────────────────────────────────────────
    STORAGE BACKEND
    Three modes, auto-selected:
@@ -151,9 +151,6 @@ const store = {
    HELPERS
 ═══════════════════════════════════════════════════════════════════ */
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-const lerp = (a, b, t) => a + (b - a) * t;
-const lerpPt = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t)];
-const easeInOut = (t) => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 
 const fmtClock = (ms) => {
   const s = Math.max(0, Math.floor(ms / 1000));
@@ -163,8 +160,13 @@ const fmtClock = (ms) => {
 const fmtMS = (sec) => `${Math.floor(sec / 60)}:${String(Math.max(0, sec % 60)).padStart(2, '0')}`;
 const fmtDate = (ts) => new Date(ts).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
 
-const vol = (w) => !w?.exercises ? 0 : w.exercises.reduce((s, ex) => s + ex.sets.filter(x => x.done).reduce((a, x) => a + (+x.w || 0) * (+x.r || 0), 0), 0);
-const setCount = (w) => !w?.exercises ? 0 : w.exercises.reduce((n, ex) => n + ex.sets.filter(x => x.done).length, 0);
+const vol = (w) => !w?.exercises ? 0 : w.exercises.reduce((s, ex) => s + ex.sets.filter(x => x.done && x.t !== 'W').reduce((a, x) => a + (+x.w || 0) * (+x.r || 0), 0), 0);
+const setCount = (w) => !w?.exercises ? 0 : w.exercises.reduce((n, ex) => n + ex.sets.filter(x => x.done && x.t !== 'W').length, 0);
+
+// Local-timezone day helpers — UTC math flips dates at 05:30 IST, not midnight.
+const pad2 = (n) => String(n).padStart(2, '0');
+const localDateStr = (offsetDays = 0) => { const d = new Date(); d.setDate(d.getDate() - offsetDays); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+const localDayIndex = () => Math.floor((Date.now() - new Date().getTimezoneOffset() * 60000) / 864e5);
 
 // Firebase Realtime DB strips empty arrays — these restore expected shapes after reads.
 const normEx = (ex) => ({ ...ex, sets: ex.sets || [], sm: ex.sm || [] });
@@ -180,162 +182,57 @@ const bestBefore = (name, history, beforeTs) => {
   for (const wk of history) {
     if (beforeTs && wk.startTime >= beforeTs) continue;
     const ex = wk.exercises.find(e => e.n === name);
-    if (ex) for (const s of ex.sets) best = Math.max(best, e1rm(s.w, s.r));
+    if (ex) for (const s of ex.sets) { if (s.t !== 'W') best = Math.max(best, e1rm(s.w, s.r)); }
   }
   return best;
+};
+// Chronological best-e1RM per session for one exercise (warm-ups excluded)
+const sessionsFor = (name, history) => {
+  const out = [];
+  (history || []).forEach(w => {
+    const ex = w.exercises.find(e => e.n === name);
+    if (!ex) return;
+    let best = 0, top = null;
+    (ex.sets || []).forEach(s => { if (s.t === 'W') return; const v = e1rm(s.w, s.r); if (v > best) { best = v; top = s; } });
+    if (best > 0) out.push({ ts: w.startTime, v: best, top });
+  });
+  return out.sort((a, b) => a.ts - b.ts);
 };
 
 /* ════════════════════════════════════════════════════════════════
    MOTION ENGINE — real demo photos (start ⇄ finish crossfade) with
-   an articulated capsule-figure fallback for offline & custom moves.
+   a muscle-target body-map fallback for offline & custom moves.
 ═══════════════════════════════════════════════════════════════════ */
 const IMG_BASE = 'https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/';
 
-const STAND = { head:[52,27], chest:[52,54], pelvis:[52,100], elbow:[52,80], hand:[52,106], knee:[52,135], foot:[52,168] };
-const P = (o) => ({ ...STAND, ...o });
+// Regions rendered on the back view of the body map
+const BACK_REGIONS = new Set(['back', 'lowerback', 'glutes', 'hamstrings', 'triceps']);
 
-const ARCHETYPES = {
-  pressvert:  { load:'bar', dur:1500, frames:[ P({elbow:[63,69],hand:[59,47]}), P({elbow:[54,36],hand:[55,10]}) ] },
-  presshoriz: { load:'bar', prop:'bench', dur:1500, frames:[
-    P({head:[18,118],chest:[40,124],pelvis:[80,126],knee:[96,144],foot:[100,167],elbow:[46,146],hand:[38,128]}),
-    P({head:[18,118],chest:[40,124],pelvis:[80,126],knee:[96,144],foot:[100,167],elbow:[40,102],hand:[38,90]}) ] },
-  fly: { load:'db', prop:'bench', dur:1700, frames:[
-    P({head:[18,118],chest:[40,124],pelvis:[80,126],knee:[96,144],foot:[100,167],elbow:[58,142],hand:[68,140]}),
-    P({head:[18,118],chest:[40,124],pelvis:[80,126],knee:[96,144],foot:[100,167],elbow:[42,104],hand:[40,92]}) ] },
-  pullvert: { load:'none', prop:'pullbar', dur:1600, frames:[
-    P({hand:[55,18],elbow:[55,44],chest:[55,72],head:[55,48],pelvis:[55,112],knee:[59,138],foot:[56,158]}),
-    P({hand:[55,18],elbow:[63,34],chest:[55,48],head:[56,24],pelvis:[55,88],knee:[62,114],foot:[58,136]}) ] },
-  pullhoriz: { load:'bar', dur:1400, frames:[
-    P({pelvis:[44,102],chest:[72,72],head:[87,57],knee:[46,134],foot:[48,168],elbow:[75,97],hand:[72,120]}),
-    P({pelvis:[44,102],chest:[72,72],head:[87,57],knee:[46,134],foot:[48,168],elbow:[80,82],hand:[75,94]}) ] },
-  squat: { load:'bar-back', dur:1800, frames:[
-    P({elbow:[62,68],hand:[57,50]}),
-    P({pelvis:[40,127],knee:[66,139],foot:[52,168],chest:[57,86],head:[63,61],elbow:[68,98],hand:[62,80]}) ] },
-  hinge: { load:'bar', dur:1800, frames:[
-    P({}),
-    P({chest:[77,79],head:[91,63],pelvis:[40,97],knee:[47,131],foot:[50,168],elbow:[73,101],hand:[68,124]}) ] },
-  lunge: { load:'db', dur:1700, frames:[
-    P({knee2:[48,135],foot2:[48,168]}),
-    P({pelvis:[56,120],chest:[56,74],head:[56,48],knee:[73,144],foot:[73,168],knee2:[38,150],foot2:[22,164],elbow:[56,98],hand:[56,122]}) ] },
-  curl: { load:'db', dur:1400, frames:[ P({hand:[56,106],elbow:[52,80]}), P({hand:[63,57],elbow:[52,80]}) ] },
-  extension: { load:'cable', dur:1300, frames:[ P({hand:[63,66],elbow:[52,82]}), P({hand:[59,104],elbow:[52,82]}) ] },
-  lateralraise:{ load:'db', dur:1500, frames:[ P({}), P({elbow:[69,66],hand:[87,60]}) ] },
-  frontraise: { load:'db', dur:1500, frames:[ P({}), P({elbow:[70,64],hand:[89,56]}) ] },
-  rearfly: { load:'db', dur:1500, frames:[
-    P({pelvis:[44,102],chest:[70,74],head:[85,59],knee:[46,134],foot:[48,168],elbow:[73,98],hand:[71,117]}),
-    P({pelvis:[44,102],chest:[70,74],head:[85,59],knee:[46,134],foot:[48,168],elbow:[81,79],hand:[92,68]}) ] },
-  shrug: { load:'db', dur:1200, frames:[
-    P({elbow:[51,82],hand:[50,108]}),
-    P({chest:[52,49],head:[52,22],elbow:[51,77],hand:[50,103]}) ] },
-  calf: { load:'none', dur:1200, frames:[
-    P({}),
-    P({pelvis:[52,92],chest:[52,46],head:[52,19],knee:[52,128],elbow:[52,72],hand:[52,98]}) ] },
-  legext: { load:'none', prop:'seat', dur:1500, frames:[
-    P({pelvis:[44,116],chest:[40,72],head:[40,46],elbow:[43,96],hand:[45,116],knee:[66,120],foot:[62,151]}),
-    P({pelvis:[44,116],chest:[40,72],head:[40,46],elbow:[43,96],hand:[45,116],knee:[66,120],foot:[95,114]}) ] },
-  legcurl: { load:'none', prop:'benchlow', dur:1500, frames:[
-    P({head:[12,116],chest:[34,120],pelvis:[66,122],elbow:[30,138],hand:[26,154],knee:[88,124],foot:[108,126]}),
-    P({head:[12,116],chest:[34,120],pelvis:[66,122],elbow:[30,138],hand:[26,154],knee:[88,124],foot:[92,92]}) ] },
-  hipthrust: { load:'bar-hip', prop:'benchleft', dur:1500, frames:[
-    P({head:[14,104],chest:[27,114],pelvis:[52,142],knee:[74,128],foot:[78,167],elbow:[34,124],hand:[44,136]}),
-    P({head:[14,102],chest:[27,112],pelvis:[55,113],knee:[76,120],foot:[78,167],elbow:[34,122],hand:[46,124]}) ] },
-  ab: { load:'none', dur:1500, frames:[
-    P({pelvis:[58,160],knee:[78,136],foot:[92,164],chest:[35,164],head:[20,157],elbow:[30,150],hand:[26,141]}),
-    P({pelvis:[58,160],knee:[78,136],foot:[92,164],chest:[44,146],head:[33,133],elbow:[39,133],hand:[35,124]}) ] },
-  generic: { load:'none', dur:2200, frames:[
-    P({}),
-    P({pelvis:[52,103],chest:[52,57],head:[52,30],knee:[52,137],elbow:[52,83],hand:[52,109]}) ] },
-};
-
-const KEYS = ['head','chest','pelvis','elbow','hand','knee','foot','elbow2','hand2','knee2','foot2'];
-function resolveFrame(f) {
-  const off = (p) => [p[0] - 4, p[1] - 3];
-  return { ...f,
-    elbow2: f.elbow2 || off(f.elbow), hand2: f.hand2 || off(f.hand),
-    knee2:  f.knee2  || off(f.knee),  foot2: f.foot2 || off(f.foot) };
-}
-
-function Prop({ kind }) {
-  const st = { fill: T.surfaceHi, stroke: T.borderHi, strokeWidth: 1.2 };
-  if (kind === 'bench') return (<g>
-    <rect x="16" y="132" width="84" height="7" rx="3" {...st} />
-    <line x1="26" y1="139" x2="26" y2="168" stroke={T.borderHi} strokeWidth="3" />
-    <line x1="88" y1="139" x2="88" y2="168" stroke={T.borderHi} strokeWidth="3" /></g>);
-  if (kind === 'benchlow') return (<g>
-    <rect x="6" y="130" width="106" height="7" rx="3" {...st} />
-    <line x1="16" y1="137" x2="16" y2="168" stroke={T.borderHi} strokeWidth="3" />
-    <line x1="98" y1="137" x2="98" y2="168" stroke={T.borderHi} strokeWidth="3" /></g>);
-  if (kind === 'benchleft') return (<g>
-    <rect x="2" y="118" width="30" height="7" rx="3" {...st} />
-    <line x1="8" y1="125" x2="8" y2="168" stroke={T.borderHi} strokeWidth="3" />
-    <line x1="26" y1="125" x2="26" y2="168" stroke={T.borderHi} strokeWidth="3" /></g>);
-  if (kind === 'seat') return (<g>
-    <line x1="28" y1="118" x2="25" y2="72" stroke={T.borderHi} strokeWidth="5" />
-    <rect x="26" y="118" width="30" height="8" rx="2" {...st} />
-    <line x1="41" y1="126" x2="41" y2="168" stroke={T.borderHi} strokeWidth="4" /></g>);
-  if (kind === 'pullbar') return (<g>
-    <line x1="26" y1="16" x2="84" y2="16" stroke={T.borderHi} strokeWidth="3.5" strokeLinecap="round" />
-    <line x1="28" y1="16" x2="28" y2="2" stroke={T.borderHi} strokeWidth="2.5" />
-    <line x1="82" y1="16" x2="82" y2="2" stroke={T.borderHi} strokeWidth="2.5" /></g>);
-  return null;
-}
-
-function loadGlyph(load, pose) {
-  const bar = (p, half) => <line x1={p[0] - half} y1={p[1]} x2={p[0] + half} y2={p[1]} stroke={T.text} strokeWidth="3.4" strokeLinecap="round" opacity="0.9" />;
-  if (load === 'bar') return bar(pose.hand, 16);
-  if (load === 'bar-back') return bar([pose.chest[0], pose.chest[1] - 3], 17);
-  if (load === 'bar-hip') return bar([pose.pelvis[0], pose.pelvis[1] - 5], 17);
-  if (load === 'db') { const [x, y] = pose.hand; return (<g opacity="0.9">
-    <line x1={x - 8} y1={y} x2={x + 8} y2={y} stroke={T.text} strokeWidth="2.6" />
-    <circle cx={x - 8} cy={y} r="3.2" fill={T.text} /><circle cx={x + 8} cy={y} r="3.2" fill={T.text} /></g>); }
-  if (load === 'cable') return <line x1={pose.hand[0]} y1={pose.hand[1]} x2={pose.hand[0] + 4} y2={4} stroke={T.textMute} strokeWidth="1.4" strokeDasharray="3 3" />;
-  return null;
-}
-
-function RangeOfMotion({ archetype = 'generic', size = 150, playing = true, accent = T.text }) {
-  const arch = ARCHETYPES[archetype] || ARCHETYPES.generic;
-  const A = useMemo(() => resolveFrame(arch.frames[0]), [archetype]);
-  const B = useMemo(() => resolveFrame(arch.frames[1]), [archetype]);
-  const [pose, setPose] = useState(A);
-  const raf = useRef(0);
-  useEffect(() => {
-    setPose(A);
-    if (!playing) return;
-    const t0 = performance.now();
-    const loop = (now) => {
-      const el = (now - t0) % (arch.dur * 2);
-      const ph = el < arch.dur ? el / arch.dur : 1 - (el - arch.dur) / arch.dur;
-      const t = easeInOut(ph);
-      const np = {};
-      KEYS.forEach(k => { np[k] = lerpPt(A[k], B[k], t); });
-      setPose(np);
-      raf.current = requestAnimationFrame(loop);
-    };
-    raf.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(raf.current);
-  }, [archetype, playing]);
-
-  const detail = size >= 70;
-  const { head, chest, pelvis, elbow, hand, knee, foot, elbow2, hand2, knee2, foot2 } = pose;
-  const W = 9;
-  const limb = (pts, op = 1) => <polyline points={pts.map(p => p.join(',')).join(' ')} fill="none" stroke={accent} strokeWidth={W} strokeLinecap="round" strokeLinejoin="round" opacity={op} />;
-  const joint = (p) => <circle cx={p[0]} cy={p[1]} r="2.4" fill="rgba(0,0,0,0.38)" />;
-  const upright = chest[1] < pelvis[1];
+// Highlighted body map showing which muscles an exercise targets (gold = primary, grey = assist).
+function MuscleTarget({ m, sm = [], height = 170 }) {
+  const view = BACK_REGIONS.has(m) ? 'back' : 'front';
+  const heat = { [m]: 3 };
+  (sm || []).forEach(x => { if (heat[x] == null) heat[x] = 1; });
   return (
-    <svg viewBox="0 0 112 180" width={size} height={size * 180 / 112} style={{ display: 'block' }}>
-      <line x1="6" y1="172" x2="106" y2="172" stroke={T.border} strokeWidth="1.5" />
-      {detail && <Prop kind={arch.prop} />}
-      {detail && !arch.prop && upright && <ellipse cx={foot[0]} cy="171" rx="15" ry="2.6" fill={accent} opacity="0.1" />}
-      {detail && limb([pelvis, knee2, foot2], 0.3)}
-      {detail && limb([chest, elbow2, hand2], 0.3)}
-      {limb([pelvis, knee, foot])}
-      <line x1={chest[0]} y1={chest[1]} x2={pelvis[0]} y2={pelvis[1]} stroke={accent} strokeWidth={W + 1.5} strokeLinecap="round" />
-      <line x1={chest[0]} y1={chest[1]} x2={head[0]} y2={head[1] + 6} stroke={accent} strokeWidth={W - 2} strokeLinecap="round" />
-      <circle cx={head[0]} cy={head[1]} r="8.5" fill={accent} />
-      {limb([chest, elbow, hand])}
-      {detail && joint(elbow)}{detail && joint(knee)}
-      {loadGlyph(arch.load, pose)}
-    </svg>
+    <div style={{ height, pointerEvents: 'none', display: 'grid', placeItems: 'center' }}>
+      <BodyMap view={view} heat={heat} onSelect={() => {}} />
+    </div>
+  );
+}
+
+// Photo thumbnail with graceful glyph fallback (custom exercises, offline).
+function Thumb({ ex, size = 42 }) {
+  const [err, setErr] = useState(!ex.img);
+  useEffect(() => { setErr(!ex.img); }, [ex.img]);
+  if (err) return (
+    <div style={{ width: size, height: size, borderRadius: 10, background: T.surfaceHi, border: `1px solid ${T.border}`, display: 'grid', placeItems: 'center', color: T.gold, flexShrink: 0 }}>
+      <Dumbbell size={16} />
+    </div>
+  );
+  return (
+    <div style={{ width: size, height: size, borderRadius: 10, overflow: 'hidden', background: '#fff', border: `1px solid ${T.border}`, flexShrink: 0 }}>
+      <img src={IMG_BASE + ex.img + '/0.jpg'} alt="" loading="lazy" decoding="async" onError={() => setErr(true)} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+    </div>
   );
 }
 
@@ -343,9 +240,9 @@ function ExerciseMedia({ ex, height = 200 }) {
   const [err, setErr] = useState(false);
   const [ready, setReady] = useState(false);
   if (!ex.img || err) return (
-    <div style={{ display: 'grid', placeItems: 'center', padding: '10px 0 14px', background: T.bgEl, borderRadius: 16, border: `1px solid ${T.border}` }}>
-      <RangeOfMotion archetype={ex.a} size={Math.round(height * 0.8)} playing accent={T.text} />
-      <div style={{ fontSize: 10, color: T.textMute, letterSpacing: 1.5 }}>RANGE OF MOTION</div>
+    <div style={{ padding: '12px 0 10px', background: T.bgEl, borderRadius: 16, border: `1px solid ${T.border}` }}>
+      <MuscleTarget m={ex.m} sm={ex.sm} height={Math.max(120, height - 48)} />
+      <div style={{ textAlign: 'center', fontSize: 10, color: T.textMute, letterSpacing: 1.5, marginTop: 6 }}>TARGET MUSCLES</div>
     </div>);
   const u = (i) => IMG_BASE + ex.img + '/' + i + '.jpg';
   const im = { position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain' };
@@ -459,33 +356,42 @@ function BodyMap({ view, heat, onSelect }) {
    ROOT
 ═══════════════════════════════════════════════════════════════════ */
 function AppInner() {
-  const [tab, setTab] = useState('body');
+  const [tab, setTab] = useState('garmin');
   const [history, setHistory] = useState([]);
   const [active, setActive] = useState(null);
   const [custom, setCustom] = useState([]);
   const [templates, setTemplates] = useState([]);
   const [weights, setWeights] = useState([]);
+  const [programIdx, setProgramIdx] = useState(0);
   const [settings, setSettings] = useState({ unit: 'kg', rest: 90, wInc: 2.5, rInc: 1 });
   const [restEnd, setRestEnd] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [sheet, setSheet] = useState(null); // {type, ...}
   const [confirmState, setConfirmState] = useState(null);
+  const [summary, setSummary] = useState(null);
   const ask = (message, onYes) => setConfirmState({ message, onYes });
   const [sync, setSync] = useState(SyncBus.state);
   useEffect(() => SyncBus.on((s) => setSync(s)), []);
 
+  // Re-render each second ONLY while a workout or rest timer is live —
+  // idle tabs (Garmin, Library, History) stay perfectly still.
   const [, force] = useState(0);
-  useEffect(() => { const i = setInterval(() => force(x => x + 1), 1000); return () => clearInterval(i); }, []);
+  const needsTick = !!active || !!restEnd;
+  useEffect(() => {
+    if (!needsTick) return;
+    const i = setInterval(() => force(x => x + 1), 1000);
+    return () => clearInterval(i);
+  }, [needsTick]);
 
-  const writing = useRef({});
   const seen = useRef({});
   useEffect(() => { (async () => {
-    const [h, a, c, s, r, tp, wt] = await Promise.all([
+    const [h, a, c, s, r, tp, wt, pg] = await Promise.all([
       store.get(K.history, []), store.get(K.active, null), store.get(K.custom, []),
       store.get(K.settings, { unit: 'kg', rest: 90, wInc: 2.5, rInc: 1 }), store.get(K.rest, null),
-      store.get(K.templates, []), store.get(K.weights, []),
+      store.get(K.templates, []), store.get(K.weights, []), store.get(K.program, 0),
     ]);
-    setHistory(normHistory(h)); setActive(normActive(a)); setCustom(c); setSettings(s); setRestEnd(r); setTemplates(normTemplates(tp)); setWeights(wt); setLoaded(true);
+    setHistory(normHistory(h)); setActive(normActive(a)); setCustom(c); setSettings(s); setRestEnd(r); setTemplates(normTemplates(tp)); setWeights(wt); setProgramIdx(typeof pg === 'number' ? pg : 0); setLoaded(true);
+    store.set(K.schema, 2); // data-shape version marker for future migrations
   })(); }, []);
 
   // Live cross-device sync: remote changes flow into local state.
@@ -511,6 +417,7 @@ function AppInner() {
       make(K.settings, (v) => v && setSettings(v), null),
       make(K.templates, setTemplates, [], normTemplates),
       make(K.weights, setWeights, []),
+      make(K.program, (v) => setProgramIdx(typeof v === 'number' ? v : 0), 0),
     ].filter(Boolean);
     return () => subs.forEach(u => u && u());
   }, [loaded]);
@@ -520,6 +427,7 @@ function AppInner() {
   useEffect(() => { if (loaded) { seen.current[K.custom] = JSON.stringify(custom); store.set(K.custom, custom); } }, [custom, loaded]);
   useEffect(() => { if (loaded) { seen.current[K.templates] = JSON.stringify(templates); store.set(K.templates, templates); } }, [templates, loaded]);
   useEffect(() => { if (loaded) { seen.current[K.weights] = JSON.stringify(weights); store.set(K.weights, weights); } }, [weights, loaded]);
+  useEffect(() => { if (loaded) { seen.current[K.program] = JSON.stringify(programIdx); store.set(K.program, programIdx); } }, [programIdx, loaded]);
   useEffect(() => { if (loaded) { seen.current[K.settings] = JSON.stringify(settings); store.set(K.settings, settings); } }, [settings, loaded]);
   useEffect(() => { if (loaded) { seen.current[K.rest] = JSON.stringify(restEnd || null); restEnd ? store.set(K.rest, restEnd) : store.del(K.rest); } }, [restEnd, loaded]);
 
@@ -576,13 +484,21 @@ function AppInner() {
   const toggleDone = (ei, si) => {
     const s = active.exercises[ei].sets[si]; const willDone = !s.done;
     updateSet(ei, si, { done: willDone });
+    if (willDone && navigator.vibrate) navigator.vibrate(12);
     if (willDone && settings.rest > 0) setRestEnd(Date.now() + settings.rest * 1000);
   };
   const finish = () => {
     const done = { ...active, endTime: Date.now(),
       exercises: (active.exercises || []).map(ex => ({ ...ex, sets: (ex.sets || []).filter(s => s.done && s.r) })).filter(ex => ex.sets.length) };
     if (!done.exercises.length) { ask('No sets were completed. Discard this workout?', () => { setActive(null); setRestEnd(null); }); return; }
-    setHistory(h => [...h, done]); setActive(null); setRestEnd(null); setTab('history');
+    const prNames = [];
+    done.exercises.forEach(ex => {
+      const base = bestBefore(ex.n, history);
+      let best = 0; ex.sets.forEach(s => { if (s.t !== 'W') best = Math.max(best, e1rm(s.w, s.r)); });
+      if (best > 0 && best > base) prNames.push(ex.n);
+    });
+    setHistory(h => [...h, done]); setActive(null); setRestEnd(null);
+    setSummary({ name: done.name, dur: done.endTime - done.startTime, vol: vol(done), sets: setCount(done), prs: prNames });
   };
   const cancel = () => ask('Discard this workout? All logged sets will be lost.', () => { setActive(null); setRestEnd(null); });
 
@@ -595,11 +511,17 @@ function AppInner() {
   }, [history]);
 
   const prBaseline = useCallback((name) => bestBefore(name, history), [history]);
-  const saveTemplate = (a) => setTemplates(t => [{ id: uid(), name: a.name || 'Template', exercises: a.exercises.map(({ n, m, sm, eq, a: ar, i, img }) => ({ n, m, sm, eq, a: ar, i, img })) }, ...t]);
+  const saveTemplate = (a) => {
+    if (!a || !(a.exercises || []).length) return;
+    const sig = a.exercises.map(e => e.n).join('|');
+    setTemplates(t => t.some(x => (x.exercises || []).map(e => e.n).join('|') === sig)
+      ? t   // identical template already saved — don't duplicate
+      : [{ id: uid(), name: a.name || 'Template', exercises: a.exercises.map(({ n, m, sm, eq, a: ar, i, img }) => ({ n, m, sm, eq, a: ar, i, img })) }, ...t]);
+  };
 
   const addCustom = (n, m, eq, a) => { const ex = { n, m, sm: [], eq, lv: 'I', mech: 'C', a, i: 'Custom exercise.', custom: true }; setCustom(c => [ex, ...c]); return ex; };
 
-  if (!loaded) return <div style={{ ...S.app, display: 'grid', placeItems: 'center' }}><span style={{ color: T.textDim }}>Loading…</span></div>;
+  if (!loaded) return <div style={{ ...S.app, display: 'grid', placeItems: 'center' }}><Dumbbell size={30} color={T.gold} className="pulse" /></div>;
 
   return (
     <div style={S.app}>
@@ -625,11 +547,13 @@ function AppInner() {
             active={active} />
         )}
         {tab === 'workout' && (
-          <WorkoutTab active={active} settings={settings} prevFor={prevFor} ask={ask} templates={templates} prBaseline={prBaseline} onSaveTemplate={() => saveTemplate(active)} onStartTemplate={(t) => startWorkout(t.name, t.exercises)} onDeleteTemplate={(id) => ask('Delete this template?', () => setTemplates(ts => ts.filter(x => x.id !== id)))}
+          <WorkoutTab active={active} settings={settings} prevFor={prevFor} ask={ask} templates={templates} prBaseline={prBaseline} programIdx={programIdx} onStartProgram={() => { const day = PROGRAM[programIdx % PROGRAM.length]; startWorkout(day.name, day.exercises); setProgramIdx(i => (i + 1) % PROGRAM.length); }} onSkipProgram={() => setProgramIdx(i => (i + 1) % PROGRAM.length)} onSaveTemplate={() => saveTemplate(active)} onStartTemplate={(t) => startWorkout(t.name, t.exercises)} onDeleteTemplate={(id) => ask('Delete this template?', () => setTemplates(ts => ts.filter(x => x.id !== id)))}
             onStart={() => startWorkout()}
             onAdd={() => setSheet({ type: 'picker' })}
             onRemoveExercise={removeExercise} onUpdateSet={updateSet}
             onAddSet={addSet} onRemoveSet={removeSet} onToggleDone={toggleDone}
+            onSetType={(ei, si, t) => updateSet(ei, si, { t: t || null })}
+            onExNote={(ei, note) => setActive(a => { const exs = [...a.exercises]; exs[ei] = { ...exs[ei], note }; return { ...a, exercises: exs }; })}
             onRename={(n) => setActive(a => ({ ...a, name: n }))}
             onFinish={finish} onCancel={cancel}
             onOpenDetail={(ex) => setSheet({ type: 'detail', ex })} />
@@ -682,13 +606,14 @@ function AppInner() {
           onReset={() => ask('Wipe everything — history, custom exercises and settings?', () => { setHistory([]); setCustom([]); setActive(null); setRestEnd(null); setSettings({ unit: 'kg', rest: 90, wInc: 2.5, rInc: 1 }); })} />
       )}
       {sheet?.type === 'export' && (
-        <ExportSheet history={history} custom={custom} settings={settings} onClose={() => setSheet({ type: 'settings' })} />
+        <ExportSheet history={history} custom={custom} settings={settings} weights={weights} onClose={() => setSheet({ type: 'settings' })} />
       )}
       {sheet?.type === 'weight' && (
         <WeightSheet weights={weights} unit={settings.unit} onClose={() => setSheet(null)}
           onLog={(v) => setWeights(ws => [...ws, { ts: Date.now(), v }])}
           onDelete={(ts) => setWeights(ws => ws.filter(x => x.ts !== ts))} />
       )}
+      <FinishSheet summary={summary} unit={settings.unit} onClose={() => { setSummary(null); setTab('history'); }} />
       <ConfirmDialog state={confirmState} onClose={() => setConfirmState(null)} />
     </div>
   );
@@ -697,27 +622,34 @@ function AppInner() {
 /* ════════════════════════════════════════════════════════════════
    BODY TAB
 ═══════════════════════════════════════════════════════════════════ */
+// ── DAILY IMAGE BANNER ──
+// Drop your panels into public/quotes/ named 1.jpg, 2.jpg, 3.jpg …
+// Set QUOTE_IMAGE_COUNT to however many files you add.
+const QUOTE_IMAGE_COUNT = 20;
+const QUOTE_IMG_PATH = '/quotes/';
+
+// Original lines in the spirit of the Grand Line — dreams, crews, storms, and crowns.
 const QUOTES = [
-  'The set you skip never builds anything.',
-  'Discipline is just remembering what you want.',
-  'Show up — the body keeps the receipts.',
-  'Heavy is a feeling. Strong is a habit.',
-  "You don't find energy. You build it.",
-  'One more rep is a decision, not a gift.',
-  'Sore today. Capable tomorrow.',
-  'Progress hides inside boring consistency.',
-  'Train the body. The mind follows.',
-  'Nobody warms up the bar for you.',
-  'Small plates, stacked weekly, unrecognizable yearly.',
-  'Your future self is watching this set.',
-  'Earn the shower.',
-  'Strength is rented. Training pays the rent.',
-  'Start slow. Finish proud.',
-  'The gym rewards attendance.',
-  'Last set, best set.',
-  'Quiet work. Loud results.',
-  'Motivation starts the workout. Habit finishes it.',
-  'Rest is part of the program, not an escape from it.',
+  'Set sail anyway. Calm seas never made a king.',
+  "Your dream doesn't care if you're tired. Hoist the sails.",
+  'The treasure was never the gold. It is who you become hunting it.',
+  'Storms do not sink ships. Surrender does.',
+  'Train like the whole crew is counting on you.',
+  'A king of the gym bows to no plateau.',
+  'Willpower is just strength that has not surfaced yet.',
+  'The grand line of gains starts with the first set today.',
+  'Rubber stretches. So do limits. Pull harder.',
+  'No one becomes a legend anchored in the harbor.',
+  'Eat well. Train hard. Laugh loud. Conquer the sea.',
+  'Your only rival is yesterday\'s log entry.',
+  'Scars are the map of every storm you outlasted.',
+  'Sail until the horizon runs out — then keep sailing.',
+  'Crews are built in hard waters. So are bodies.',
+  'Declare your dream out loud. Then lift like you meant it.',
+  'The will of the iron is inherited, one lifter at a time.',
+  'Adventure favors the one who shows up at dawn.',
+  'One more rep. One more mile of ocean. The crown waits.',
+  'Small ship, vast sea. Row anyway.',
 ];
 
 function BodyTab({ heat, weights, unit, onLogWeight, onMuscle, onStart, hasActive }) {
@@ -725,13 +657,9 @@ function BodyTab({ heat, weights, unit, onLogWeight, onMuscle, onStart, hasActiv
   const prevW = weights[weights.length - 2];
   const delta = latest && prevW ? latest.v - prevW.v : null;
   const [view, setView] = useState('front');
-  const quote = useMemo(() => QUOTES[Math.floor(Date.now() / 864e5) % QUOTES.length], []); // cycles daily
   return (
     <div style={{ padding: '20px 18px 12px' }}>
       <div style={S.h1}>Body</div>
-      <div className="fade-in" style={{ fontSize: 13.5, color: T.textDim, marginTop: 6, fontStyle: 'italic', lineHeight: 1.5 }}>
-        “{quote}”
-      </div>
 
       <div style={{ display: 'flex', justifyContent: 'center', margin: '14px auto 4px', width: 'fit-content', background: T.surfaceHi, borderRadius: 10, padding: 3 }}>
         {['front', 'back'].map(v => (
@@ -768,8 +696,6 @@ function BodyTab({ heat, weights, unit, onLogWeight, onMuscle, onStart, hasActiv
         </div>
         <button style={{ background: T.gold, color: '#000', border: 'none', borderRadius: 9, padding: '10px 16px', fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: FB }} onClick={onLogWeight}>Log</button>
       </div>
-
-      <button style={S.primaryBtn} onClick={onStart}>{hasActive ? 'Resume workout' : 'Start empty workout'}</button>
     </div>
   );
 }
@@ -777,13 +703,27 @@ function BodyTab({ heat, weights, unit, onLogWeight, onMuscle, onStart, hasActiv
 /* ════════════════════════════════════════════════════════════════
    WORKOUT TAB
 ═══════════════════════════════════════════════════════════════════ */
-function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, onSaveTemplate, onStartTemplate, onDeleteTemplate, onStart, onAdd, onRemoveExercise, onUpdateSet, onAddSet, onRemoveSet, onToggleDone, onRename, onFinish, onCancel, onOpenDetail }) {
+const PROGRAM = [{"name":"Push Day A","exercises":[{"n":"Barbell Bench Press - Medium Grip","m":"chest","sm":["shoulders","triceps"],"eq":"Barbell","a":"presshoriz","i":"Lie back on a flat bench.","img":"Barbell_Bench_Press_-_Medium_Grip"},{"n":"Standing Military Press","m":"shoulders","sm":["triceps"],"eq":"Barbell","a":"pressvert","i":"Start by placing a barbell that is about chest high on a squat rack.","img":"Standing_Military_Press"},{"n":"Incline Dumbbell Press","m":"chest","sm":["shoulders","triceps"],"eq":"Dumbbell","a":"presshoriz","i":"Lie back on an incline bench with a dumbbell in each hand atop your thighs.","img":"Incline_Dumbbell_Press"},{"n":"Side Lateral Raise","m":"shoulders","sm":[],"eq":"Dumbbell","a":"lateralraise","i":"Pick a couple of dumbbells and stand with a straight torso and the dumbbells by your side at arms length with the palms of the hand facing you.","img":"Side_Lateral_Raise"},{"n":"Triceps Pushdown","m":"triceps","sm":[],"eq":"Cable","a":"extension","i":"Attach a straight or angled bar to a high pulley and grab with an overhand grip (palms facing down) at shoulder width.","img":"Triceps_Pushdown"}]},{"name":"Pull Day A","exercises":[{"n":"Barbell Deadlift","m":"lowerback","sm":["calves","forearms","glutes","hamstrings","back","back","quads","traps"],"eq":"Barbell","a":"hinge","i":"Stand in front of a loaded barbell.","img":"Barbell_Deadlift"},{"n":"Pullups","m":"back","sm":["biceps","back"],"eq":"Bodyweight","a":"pullvert","i":"Grab the pull-up bar with the palms facing forward using the prescribed grip.","img":"Pullups"},{"n":"Bent Over Barbell Row","m":"back","sm":["biceps","back","shoulders"],"eq":"Barbell","a":"pullhoriz","i":"Holding a barbell with a pronated grip (palms facing down), bend your knees slightly and bring your torso forward, by bending at the waist, while keeping the back…","img":"Bent_Over_Barbell_Row"},{"n":"Face Pull","m":"shoulders","sm":["back"],"eq":"Cable","a":"rearfly","i":"Facing a high pulley with a rope or dual handles attached, pull the weight directly towards your face, separating your hands as you do so.","img":"Face_Pull"},{"n":"Barbell Curl","m":"biceps","sm":["forearms"],"eq":"Barbell","a":"curl","i":"Stand up with your torso upright while holding a barbell at a shoulder-width grip.","img":"Barbell_Curl"}]},{"name":"Leg Day A","exercises":[{"n":"Barbell Full Squat","m":"quads","sm":["calves","glutes","hamstrings","lowerback"],"eq":"Barbell","a":"squat","i":"This exercise is best performed inside a squat rack for safety purposes.","img":"Barbell_Full_Squat"},{"n":"Romanian Deadlift","m":"hamstrings","sm":["calves","glutes","lowerback"],"eq":"Barbell","a":"hinge","i":"Put a barbell in front of you on the ground and grab it using a pronated (palms facing down) grip that a little wider than shoulder width.","img":"Romanian_Deadlift"},{"n":"Leg Press","m":"quads","sm":["calves","glutes","hamstrings"],"eq":"Machine","a":"squat","i":"Using a leg press machine, sit down on the machine and place your legs on the platform directly in front of you at a medium (shoulder width) foot stance.","img":"Leg_Press"},{"n":"Lying Leg Curls","m":"hamstrings","sm":[],"eq":"Machine","a":"legcurl","i":"Adjust the machine lever to fit your height and lie face down on the leg curl machine with the pad of the lever on the back of your legs (just a few inches under the calves).","img":"Lying_Leg_Curls"},{"n":"Standing Calf Raises","m":"calves","sm":[],"eq":"Machine","a":"calf","i":"Adjust the padded lever of the calf raise machine to fit your height.","img":"Standing_Calf_Raises"},{"n":"Crunches","m":"abs","sm":[],"eq":"Bodyweight","a":"ab","i":"Lie flat on your back with your feet flat on the ground, or resting on a bench with your knees bent at a 90 degree angle.","img":"Crunches"}]},{"name":"Push Day B","exercises":[{"n":"Seated Dumbbell Press","m":"shoulders","sm":["triceps"],"eq":"Dumbbell","a":"pressvert","i":"Grab a couple of dumbbells and sit on a military press bench or a utility bench that has a back support on it as you place the dumbbells upright on top of your thighs.","img":"Seated_Dumbbell_Press"},{"n":"Dumbbell Bench Press","m":"chest","sm":["shoulders","triceps"],"eq":"Dumbbell","a":"presshoriz","i":"Lie down on a flat bench with a dumbbell in each hand resting on top of your thighs.","img":"Dumbbell_Bench_Press"},{"n":"Cable Crossover","m":"chest","sm":["shoulders"],"eq":"Cable","a":"fly","i":"To get yourself into the starting position, place the pulleys on a high position (above your head), select the resistance to be used and hold the pulleys in each hand.","img":"Cable_Crossover"},{"n":"Front Dumbbell Raise","m":"shoulders","sm":[],"eq":"Dumbbell","a":"pressvert","i":"Pick a couple of dumbbells and stand with a straight torso and the dumbbells on front of your thighs at arms length with the palms of the hand facing your thighs.","img":"Front_Dumbbell_Raise"},{"n":"Lying Triceps Press","m":"triceps","sm":[],"eq":"EZ Bar","a":"extension","i":"Lie on a flat bench with either an e-z bar (my preference) or a straight bar placed on the floor behind your head and your feet on the floor.","img":"Lying_Triceps_Press"},{"n":"Dips - Triceps Version","m":"triceps","sm":["chest","shoulders"],"eq":"Bodyweight","a":"extension","i":"To get into the starting position, hold your body at arm's length with your arms nearly locked above the bars.","img":"Dips_-_Triceps_Version"}]},{"name":"Pull Day B","exercises":[{"n":"T-Bar Row with Handle","m":"back","sm":["biceps","back"],"eq":"Barbell","a":"pullhoriz","i":"Position a bar into a landmine or in a corner to keep it from moving.","img":"T-Bar_Row_with_Handle"},{"n":"Wide-Grip Lat Pulldown","m":"back","sm":["biceps","back","shoulders"],"eq":"Cable","a":"pullvert","i":"Sit down on a pull-down machine with a wide bar attached to the top pulley.","img":"Wide-Grip_Lat_Pulldown"},{"n":"Seated Cable Rows","m":"back","sm":["biceps","back","shoulders"],"eq":"Cable","a":"pullhoriz","i":"For this exercise you will need access to a low pulley row machine with a V-bar.","img":"Seated_Cable_Rows"},{"n":"Barbell Shrug","m":"traps","sm":[],"eq":"Barbell","a":"shrug","i":"Stand up straight with your feet at shoulder width as you hold a barbell with both hands in front of you using a pronated grip (palms facing the thighs).","img":"Barbell_Shrug"},{"n":"Hammer Curls","m":"biceps","sm":[],"eq":"Dumbbell","a":"curl","i":"Stand up with your torso upright and a dumbbell on each hand being held at arms length.","img":"Hammer_Curls"}]},{"name":"Leg Day B","exercises":[{"n":"Front Barbell Squat","m":"quads","sm":["calves","glutes","hamstrings"],"eq":"Barbell","a":"squat","i":"This exercise is best performed inside a squat rack for safety purposes.","img":"Front_Barbell_Squat"},{"n":"Barbell Lunge","m":"quads","sm":["calves","glutes","hamstrings"],"eq":"Barbell","a":"lunge","i":"This exercise is best performed inside a squat rack for safety purposes.","img":"Barbell_Lunge"},{"n":"Leg Extensions","m":"quads","sm":[],"eq":"Machine","a":"legext","i":"For this exercise you will need to use a leg extension machine.","img":"Leg_Extensions"},{"n":"Seated Leg Curl","m":"hamstrings","sm":[],"eq":"Machine","a":"legcurl","i":"Adjust the machine lever to fit your height and sit on the machine with your back against the back support pad.","img":"Seated_Leg_Curl"},{"n":"Seated Calf Raise","m":"calves","sm":[],"eq":"Machine","a":"calf","i":"Sit on the machine and place your toes on the lower portion of the platform provided with the heels extending off.","img":"Seated_Calf_Raise"},{"n":"Hanging Leg Raise","m":"abs","sm":[],"eq":"Bodyweight","a":"ab","i":"Hang from a chin-up bar with both arms extended at arms length in top of you using either a wide grip or a medium grip.","img":"Hanging_Leg_Raise"}]}];
+
+function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, programIdx, onStartProgram, onSkipProgram, onSaveTemplate, onStartTemplate, onDeleteTemplate, onStart, onAdd, onRemoveExercise, onUpdateSet, onAddSet, onRemoveSet, onSetType, onExNote, onToggleDone, onRename, onFinish, onCancel, onOpenDetail }) {
+  const [typeTarget, setTypeTarget] = useState(null);
   if (!active) {
     return (
       <div style={{ padding: '20px 18px 24px' }}>
         <div style={S.h1}>Workout</div>
-        <div style={S.sub}>Start fresh, or launch a saved template.</div>
-        <button style={{ ...S.primaryBtn, marginTop: 14 }} onClick={onStart}>Start empty workout</button>
+        <div style={S.sub}>Follow the program, start fresh, or launch a template.</div>
+        {(() => { const day = PROGRAM[programIdx % PROGRAM.length]; const pos = (programIdx % PROGRAM.length) + 1; return (
+          <div style={{ ...S.card, borderLeft: `3px solid ${T.gold}`, padding: '14px 14px', marginTop: 16 }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.5, fontWeight: 800, color: T.gold }}>PPL PROGRAM</div>
+            <div style={{ fontWeight: 800, fontSize: 17, marginTop: 6 }}>{day.name}</div>
+            <div style={{ fontSize: 11, color: T.textDim, marginTop: 4, lineHeight: 1.5 }}>{(day.exercises || []).map(e => e.n).join(' · ')}</div>
+            <div style={{ fontSize: 10.5, color: T.textMute, marginTop: 6 }}>Session {pos} of {PROGRAM.length} · A/B rotation — different workouts each week, repeats every 2 weeks</div>
+            <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
+              <button style={{ ...S.primaryBtn, padding: '13px' }} onClick={onStartProgram}>Start {day.name}</button>
+              <button style={{ ...S.ghostBtn, flex: '0 0 auto', padding: '13px 16px' }} onClick={onSkipProgram}>Skip</button>
+            </div>
+          </div>); })()}
+        <button style={{ ...S.primaryBtn, marginTop: 12 }} onClick={onStart}>Start empty workout</button>
         {templates.length > 0 && (<>
           <div style={S.sectionLabel}>TEMPLATES</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -822,7 +762,7 @@ function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, onS
             onOpenDetail={() => onOpenDetail(ex)}
             onRemove={() => ask(`Remove ${ex.n} from this workout?`, () => onRemoveExercise(ei))}
             onUpdateSet={(si, p) => onUpdateSet(ei, si, p)}
-            onAddSet={() => onAddSet(ei)} onRemoveSet={(si) => onRemoveSet(ei, si)}
+            onAddSet={() => onAddSet(ei)} onNumTap={(si) => setTypeTarget({ ei, si })} onNote={(v) => onExNote(ei, v)}
             onToggle={(si) => onToggleDone(ei, si)} />
         ))}
         <button style={S.dashBtn} onClick={onAdd}>+ Add exercise</button>
@@ -831,6 +771,10 @@ function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, onS
           <button style={S.finishBtn} onClick={onFinish}>Finish</button>
         </div>
         <SaveTemplateBtn onSave={onSaveTemplate} />
+        <SetTypeDialog target={typeTarget}
+          onPick={(t) => { if (typeTarget) onSetType(typeTarget.ei, typeTarget.si, t); setTypeTarget(null); }}
+          onDelete={() => { if (typeTarget) onRemoveSet(typeTarget.ei, typeTarget.si); setTypeTarget(null); }}
+          onClose={() => setTypeTarget(null)} />
       </div>
     </div>
   );
@@ -857,14 +801,15 @@ function Stat({ label, value, unit }) {
   );
 }
 
-function ActiveExercise({ ex, settings, prev, prBase, onOpenDetail, onRemove, onUpdateSet, onAddSet, onRemoveSet, onToggle }) {
+function ActiveExercise({ ex, settings, prev, prBase, onOpenDetail, onRemove, onUpdateSet, onAddSet, onNumTap, onNote, onToggle }) {
   const [menu, setMenu] = useState(false);
   const [showAnim, setShowAnim] = useState(false);
+  const [editNote, setEditNote] = useState(false);
   return (
     <div style={S.card}>
       <div style={{ display: 'flex', alignItems: 'center', padding: '12px 12px 8px', position: 'relative' }}>
-        <button onClick={() => setShowAnim(s => !s)} style={S.animThumb} aria-label="Show motion">
-          <RangeOfMotion archetype={ex.a} size={40} playing={showAnim} accent={T.textDim} />
+        <button onClick={() => setShowAnim(s => !s)} style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', lineHeight: 0 }} aria-label="Show demonstration">
+          <Thumb ex={ex} size={42} />
         </button>
         <button onClick={onOpenDetail} style={{ flex: 1, minWidth: 0, textAlign: 'left', background: 'none', border: 'none', cursor: 'pointer', padding: 0, marginLeft: 10 }}>
           <div style={{ fontWeight: 700, fontSize: 16, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ex.n}</div>
@@ -872,11 +817,25 @@ function ActiveExercise({ ex, settings, prev, prBase, onOpenDetail, onRemove, on
         </button>
         <button style={S.iconBtn} onClick={() => setMenu(m => !m)}><MoreHorizontal size={20} /></button>
         {menu && (<><div style={S.backdrop} onClick={() => setMenu(false)} /><div style={S.menu}>
-          <button style={S.menuItem} onClick={() => { setMenu(false); onOpenDetail(); }}>View form & motion</button>
+          <button style={S.menuItem} onClick={() => { setMenu(false); onOpenDetail(); }}>View form & progress</button>
+          <button style={S.menuItem} onClick={() => { setMenu(false); setEditNote(true); }}>{ex.note ? 'Edit note' : 'Add note'}</button>
           <button style={{ ...S.menuItem, color: T.danger }} onClick={() => { setMenu(false); onRemove(); }}>Remove</button>
         </div></>)}
       </div>
 
+      {(editNote || ex.note) && (
+        <div style={{ padding: '0 12px 8px' }} className="fade-in">
+          {editNote ? (
+            <textarea autoFocus value={ex.note || ''} onChange={e => onNote(e.target.value)} onBlur={() => setEditNote(false)}
+              placeholder="Note — cues, seat height, tempo…" rows={2}
+              style={{ width: '100%', boxSizing: 'border-box', background: T.surfaceHi, border: `1px solid ${T.border}`, borderRadius: 10, color: T.text, fontFamily: FB, fontSize: 13, padding: 10, outline: 'none', resize: 'none' }} />
+          ) : (
+            <button onClick={() => setEditNote(true)} style={{ background: 'none', border: 'none', padding: 0, textAlign: 'left', width: '100%', cursor: 'pointer' }}>
+              <div style={{ fontSize: 12.5, color: T.silver, fontStyle: 'italic', lineHeight: 1.45 }}>{ex.note}</div>
+            </button>
+          )}
+        </div>
+      )}
       {showAnim && (
         <div style={{ padding: '2px 8px 10px' }} className="fade-in">
           <ExerciseMedia ex={ex} height={150} />
@@ -892,10 +851,10 @@ function ActiveExercise({ ex, settings, prev, prBase, onOpenDetail, onRemove, on
       </div>
 
       {(ex.sets || []).map((s, si) => (
-        <SetRow key={s.id} n={si + 1} s={s} prev={prev?.[si]} isPR={s.done && e1rm(s.w, s.r) > prBase} unit={settings.unit}
+        <SetRow key={s.id} n={si + 1} s={s} prev={prev?.[si]} isPR={s.done && s.t !== 'W' && e1rm(s.w, s.r) > prBase} unit={settings.unit}
           wInc={settings.wInc} rInc={settings.rInc}
           onChange={(p) => onUpdateSet(si, p)} onToggle={() => onToggle(si)}
-          onRemove={() => onRemoveSet(si)} />
+          onNum={() => onNumTap(si)} />
       ))}
       <button style={S.addSet} onClick={onAddSet}>+ Add set</button>
     </div>
@@ -917,10 +876,10 @@ function Stepper({ value, inc, onChange, done, width = 96 }) {
   );
 }
 
-function SetRow({ n, s, prev, isPR, unit, wInc, rInc, onChange, onToggle, onRemove }) {
+function SetRow({ n, s, prev, isPR, unit, wInc, rInc, onChange, onToggle, onNum }) {
   return (
-    <div style={{ ...S.setRow, background: s.done ? 'rgba(255,255,255,0.05)' : 'transparent' }}>
-      <button onClick={onRemove} style={{ ...S.setNum, color: s.done ? T.gold : T.textDim }} title="Tap to remove set">{n}</button>
+    <div className={s.done ? 'set-flash' : ''} style={{ ...S.setRow, background: s.done ? 'rgba(212,175,55,0.07)' : 'transparent' }}>
+      <button onClick={onNum} style={{ ...S.setNum, color: s.t === 'F' ? T.danger : s.t ? T.goldHi : (s.done ? T.gold : T.textDim), fontWeight: s.t ? 800 : 600 }} title="Set options">{s.t || n}</button>
       <span style={{ flex: 1, paddingLeft: 4, fontSize: 12, color: T.textDim, fontFamily: FM, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {prev ? `${prev.w || 0}×${prev.r}` : '—'}{isPR && <span style={S.prPill}>PR</span>}
       </span>
@@ -1007,7 +966,7 @@ function HistCard({ w, history, unit, onDelete, onRepeat }) {
     const s = new Set();
     w.exercises.forEach(ex => {
       const base = bestBefore(ex.n, history, w.startTime);
-      let best = 0; ex.sets.forEach(x => { best = Math.max(best, e1rm(x.w, x.r)); });
+      let best = 0; ex.sets.forEach(x => { if (x.t !== 'W') best = Math.max(best, e1rm(x.w, x.r)); });
       if (best > 0 && best > base) s.add(ex.n);
     });
     return s;
@@ -1030,8 +989,9 @@ function HistCard({ w, history, unit, onDelete, onRepeat }) {
           {(w.exercises || []).map((ex, i) => (
             <div key={i} style={{ padding: '8px 0', borderTop: i ? `1px solid ${T.border}` : 'none' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><div style={{ fontSize: 14, fontWeight: 600 }}>{ex.n}</div>{prs.has(ex.n) && <span style={S.prPill}>PR</span>}</div>
+              {ex.note && <div style={{ fontSize: 11.5, color: T.silver, fontStyle: 'italic', marginTop: 3 }}>{ex.note}</div>}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 5 }}>
-                {(ex.sets || []).map((s, j) => <span key={j} style={S.setPill}>{s.w || 0}×{s.r}</span>)}
+                {(ex.sets || []).map((s, j) => <span key={j} style={{ ...S.setPill, ...(s.t === 'W' ? { opacity: 0.55 } : {}) }}>{s.t ? s.t + ' ' : ''}{s.w || 0}×{s.r}</span>)}
               </div>
             </div>
           ))}
@@ -1050,6 +1010,8 @@ function HistCard({ w, history, unit, onDelete, onRepeat }) {
 ═══════════════════════════════════════════════════════════════════ */
 function LibraryTab({ library, onOpen, onNew, onSettings }) {
   const [q, setQ] = useState(''); const [region, setRegion] = useState('All'); const [eq, setEq] = useState('All');
+  const [limit, setLimit] = useState(60);
+  useEffect(() => { setLimit(60); }, [q, region, eq]);
   const equipment = useMemo(() => ['All', ...Array.from(new Set(library.map(e => e.eq))).sort()], [library]);
   const list = useMemo(() => library
     .filter(e => region === 'All' || e.m === region)
@@ -1071,17 +1033,26 @@ function LibraryTab({ library, onOpen, onNew, onSettings }) {
       <ScrollChips items={['All', ...REGIONS.map(r => r.id)]} value={region} onChange={setRegion} labels={{ All: 'All', ...REGION_LABEL }} />
       <ScrollChips items={equipment} value={eq} onChange={setEq} />
       <div style={{ marginTop: 6 }}>
-        {list.map(e => <ExRow key={e.id} e={e} onClick={() => onOpen(e)} />)}
+        {list.slice(0, limit).map(e => <ExRow key={e.id} e={e} onClick={() => onOpen(e)} />)}
+        {list.length > limit && <MoreBtn count={list.length - limit} onMore={() => setLimit(l => l + 80)} />}
         {!list.length && <div style={S.empty}>No matches.</div>}
       </div>
     </div>
   );
 }
 
+function MoreBtn({ count, onMore }) {
+  return (
+    <button style={{ width: '100%', padding: 12, background: T.surfaceHi, border: `1px solid ${T.border}`, borderRadius: 12, color: T.textDim, fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: FB, marginTop: 6 }} onClick={onMore}>
+      Show more ({count} remaining)
+    </button>
+  );
+}
+
 function ExRow({ e, onClick, right }) {
   return (
     <button style={S.exRow} onClick={onClick}>
-      <div style={S.exThumb}><RangeOfMotion archetype={e.a} size={36} playing={false} accent={T.textMute} /></div>
+      <Thumb ex={e} size={40} />
       <div style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
         <div style={{ fontSize: 15, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.n}</div>
         <div style={{ fontSize: 11, color: T.textDim, marginTop: 1 }}>{REGION_LABEL[e.m]} · {e.eq}{e.custom ? ' · Custom' : ''}</div>
@@ -1108,7 +1079,7 @@ function ScrollChips({ items, value, onChange, labels }) {
 ═══════════════════════════════════════════════════════════════════ */
 function Sheet({ title, onClose, action, children }) {
   return (
-    <div style={S.overlay} onClick={onClose}>
+    <div style={S.overlay} className="fade-in" onClick={onClose}>
       <div style={S.sheet} className="slide-up" onClick={e => e.stopPropagation()}>
         <div style={S.sheetGrip} />
         <div style={S.sheetHead}>
@@ -1124,9 +1095,14 @@ function Sheet({ title, onClose, action, children }) {
 
 function MuscleSheet({ region, library, onClose, onOpen, onStart, hasActive }) {
   const [view, setView] = useState('primary');
+  const [sel, setSel] = useState({});
+  const [limit, setLimit] = useState(60);
+  useEffect(() => { setLimit(60); }, [view]);
   const primary = library.filter(e => e.m === region);
   const secondary = library.filter(e => e.m !== region && (e.sm || []).includes(region));
   const list = view === 'primary' ? primary : secondary;
+  const count = Object.values(sel).filter(Boolean).length;
+  const toggle = (e, ev) => { ev.stopPropagation(); setSel(s => ({ ...s, [e.id]: s[e.id] ? null : e })); };
   return (
     <Sheet title={REGION_LABEL[region]} onClose={onClose}>
       <div style={{ display: 'flex', gap: 0, margin: '4px 16px 8px', background: T.surfaceHi, borderRadius: 10, padding: 3, width: 'fit-content' }}>
@@ -1134,10 +1110,21 @@ function MuscleSheet({ region, library, onClose, onOpen, onStart, hasActive }) {
           <button key={k} onClick={() => setView(k)} style={{ ...S.segBtn, fontSize: 13, background: view === k ? T.gold : 'transparent', color: view === k ? '#000' : T.textDim }}>{l}</button>
         ))}
       </div>
-      <div style={{ flex: 1, overflowY: 'auto', padding: '0 14px 16px' }}>
-        {list.map(e => <ExRow key={e.id} e={e} onClick={() => onOpen(e)} />)}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '0 14px 90px' }}>
+        {list.slice(0, limit).map(e => (
+          <ExRow key={e.id} e={e} onClick={() => onOpen(e)}
+            right={<span onClick={(ev) => toggle(e, ev)} style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', background: sel[e.id] ? T.gold : T.surfaceHi, color: '#000', fontWeight: 700, border: `1px solid ${sel[e.id] ? T.gold : T.borderHi}`, cursor: 'pointer' }}>{sel[e.id] ? <Check size={15} strokeWidth={3} /> : ''}</span>} />
+        ))}
         {!list.length && <div style={S.empty}>No exercises here.</div>}
+        {list.length > limit && <MoreBtn count={list.length - limit} onMore={() => setLimit(l => l + 80)} />}
       </div>
+      {count > 0 && (
+        <div style={S.sheetFooter}>
+          <button style={S.primaryBtn} onClick={() => onStart(Object.values(sel).filter(Boolean))}>
+            {hasActive ? `Add ${count} to workout` : `Start workout (${count})`}
+          </button>
+        </div>
+      )}
     </Sheet>
   );
 }
@@ -1145,6 +1132,8 @@ function MuscleSheet({ region, library, onClose, onOpen, onStart, hasActive }) {
 function PickerSheet({ library, onClose, onPick, onNew }) {
   const [q, setQ] = useState(''); const [region, setRegion] = useState('All');
   const [sel, setSel] = useState({});
+  const [limit, setLimit] = useState(60);
+  useEffect(() => { setLimit(60); }, [q, region]);
   const list = library
     .filter(e => region === 'All' || e.m === region)
     .filter(e => e.n.toLowerCase().includes(q.toLowerCase()))
@@ -1160,10 +1149,11 @@ function PickerSheet({ library, onClose, onPick, onNew }) {
         <ScrollChips items={['All', ...REGIONS.map(r => r.id)]} value={region} onChange={setRegion} labels={{ All: 'All', ...REGION_LABEL }} />
       </div>
       <div style={{ flex: 1, overflowY: 'auto', padding: '0 14px 80px' }}>
-        {list.map(e => (
+        {list.slice(0, limit).map(e => (
           <ExRow key={e.id} e={e} onClick={() => toggle(e)}
-            right={<span style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', background: sel[e.id] ? T.gold : T.surfaceHi, color: '#000', fontWeight: 700 }}>{sel[e.id] ? '✓' : ''}</span>} />
+            right={<span style={{ width: 26, height: 26, borderRadius: 7, display: 'grid', placeItems: 'center', background: sel[e.id] ? T.gold : T.surfaceHi, color: '#000', fontWeight: 700 }}>{sel[e.id] ? <Check size={15} strokeWidth={3} /> : ''}</span>} />
         ))}
+        {list.length > limit && <MoreBtn count={list.length - limit} onMore={() => setLimit(l => l + 80)} />}
       </div>
       {count > 0 && (
         <div style={S.sheetFooter}><button style={S.primaryBtn} onClick={confirm}>Add {count} exercise{count > 1 ? 's' : ''}</button></div>
@@ -1193,6 +1183,21 @@ function DetailSheet({ ex, unit, history, onClose, onAdd }) {
             <div style={{ fontSize: 11, color: T.textMute, marginTop: 4 }}>Epley estimate from your logged sets — weight × (1 + reps ÷ 30).</div>
           </div>
         )}
+        {(() => { const ss = sessionsFor(ex.n, history || []); if (ss.length < 2) return null; return (
+          <div style={{ ...S.weekCard, margin: '0 0 16px', padding: '12px 16px' }}>
+            <div style={S.statLabel}>EST. 1RM TREND</div>
+            <div style={{ marginTop: 8 }}><LineChart points={ss.map(p => Math.round(p.v))} /></div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9.5, color: T.textMute, fontFamily: FM, marginTop: 4 }}>
+              <span>{fmtDate(ss[0].ts)}</span><span>{ss.length} sessions</span><span>{fmtDate(ss[ss.length - 1].ts)}</span>
+            </div>
+            <div style={{ ...S.statLabel, marginTop: 14 }}>RECENT TOP SETS</div>
+            {ss.slice(-3).reverse().map((p, idx) => (
+              <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, padding: '7px 0', borderBottom: idx < Math.min(2, ss.length - 1) ? `1px solid ${T.border}` : 'none' }}>
+                <span style={{ color: T.textDim }}>{fmtDate(p.ts)}</span>
+                <span style={{ fontFamily: FM, fontWeight: 600 }}>{p.top ? `${p.top.w || 0} × ${p.top.r}` : '—'}</span>
+              </div>
+            ))}
+          </div>); })()}
         <div style={S.statLabel}>HOW TO</div>
         <p style={{ fontSize: 14, lineHeight: 1.6, color: T.textDim, marginTop: 6 }}>{ex.i}</p>
       </div>
@@ -1204,18 +1209,17 @@ function Tag({ children, dim }) {
 }
 
 function NewExerciseSheet({ onClose, onCreate }) {
-  const [n, setN] = useState(''); const [m, setM] = useState('chest'); const [eq, setEq] = useState('Barbell'); const [a, setA] = useState('presshoriz');
-  const arches = Object.keys(ARCHETYPES);
+  const [n, setN] = useState(''); const [m, setM] = useState('chest'); const [eq, setEq] = useState('Barbell');
   return (
     <Sheet title="New exercise" onClose={onClose}
-      action={<button style={{ ...S.sheetAction, opacity: n.trim() ? 1 : 0.4 }} disabled={!n.trim()} onClick={() => n.trim() && onCreate(n.trim(), m, eq, a)}>Save</button>}>
+      action={<button style={{ ...S.sheetAction, opacity: n.trim() ? 1 : 0.4 }} disabled={!n.trim()} onClick={() => n.trim() && onCreate(n.trim(), m, eq, 'generic')}>Save</button>}>
       <div style={{ padding: 16, overflowY: 'auto' }}>
         <Field label="NAME"><input value={n} onChange={e => setN(e.target.value)} placeholder="e.g. Machine Pec Deck" style={S.search} autoFocus /></Field>
         <Field label="PRIMARY MUSCLE"><ScrollChips items={REGIONS.map(r => r.id)} value={m} onChange={setM} labels={REGION_LABEL} /></Field>
         <Field label="EQUIPMENT"><ScrollChips items={['Barbell', 'Dumbbell', 'Cable', 'Machine', 'Bodyweight', 'Kettlebell', 'Band']} value={eq} onChange={setEq} /></Field>
-        <Field label="MOTION PATTERN (for fallback animation)"><ScrollChips items={arches} value={a} onChange={setA} /></Field>
-        <div style={{ display: 'grid', placeItems: 'center', marginTop: 8, padding: 12, background: T.bgEl, borderRadius: 14, border: `1px solid ${T.border}` }}>
-          <RangeOfMotion archetype={a} size={120} playing accent={T.text} />
+        <div style={{ padding: '12px 0 8px', background: T.bgEl, borderRadius: 14, border: `1px solid ${T.border}`, marginTop: 4 }}>
+          <MuscleTarget m={m} height={150} />
+          <div style={{ textAlign: 'center', fontSize: 10, color: T.textMute, letterSpacing: 1.5, marginTop: 4 }}>TARGETS</div>
         </div>
       </div>
     </Sheet>
@@ -1259,33 +1263,44 @@ function SettingsSheet({ settings, setSettings, history, custom, onClose, onExpo
 
 function buildCSV(history, unit) {
   const esc = (x) => '"' + String(x).replace(/"/g, '""') + '"';
-  const rows = [['date', 'time', 'workout', 'exercise', 'muscle', 'equipment', 'set', 'weight_' + unit, 'reps', 'volume_' + unit].join(',')];
+  const rows = [['date', 'time', 'workout', 'exercise', 'muscle', 'equipment', 'set', 'type', 'weight_' + unit, 'reps', 'volume_' + unit].join(',')];
   history.forEach(w => {
     const d = new Date(w.startTime);
     const date = d.toISOString().slice(0, 10);
     const time = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
     w.exercises.forEach(ex => ex.sets.forEach((s, i) => {
-      rows.push([date, time, esc(w.name), esc(ex.n), REGION_LABEL[ex.m] || ex.m || '', ex.eq || '', i + 1, s.w || 0, s.r || 0, (Number(s.w) || 0) * (Number(s.r) || 0)].join(','));
+      rows.push([date, time, esc(w.name), esc(ex.n), REGION_LABEL[ex.m] || ex.m || '', ex.eq || '', i + 1, s.t || 'N', s.w || 0, s.r || 0, (Number(s.w) || 0) * (Number(s.r) || 0)].join(','));
     }));
   });
   return rows.join('\n');
 }
 
-function ExportSheet({ history, custom, settings, onClose }) {
+function buildWeightsCSV(weights, unit) {
+  const rows = [['date', 'time', 'weight_' + unit].join(',')];
+  (weights || []).forEach(x => {
+    const d = new Date(x.ts);
+    rows.push([`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`, `${pad2(d.getHours())}:${pad2(d.getMinutes())}`, x.v].join(','));
+  });
+  return rows.join('\n');
+}
+
+function ExportSheet({ history, custom, settings, weights, onClose }) {
   const [fmt, setFmt] = useState('csv');
   const [copied, setCopied] = useState(false);
   const taRef = useRef(null);
   const text = useMemo(() => fmt === 'csv'
     ? buildCSV(history, settings.unit)
-    : JSON.stringify({ exportedAt: new Date().toISOString(), settings, customExercises: custom, history }, null, 2),
-  [fmt, history, custom, settings]);
+    : fmt === 'weights'
+      ? buildWeightsCSV(weights, settings.unit)
+      : JSON.stringify({ exportedAt: new Date().toISOString(), settings, customExercises: custom, history, bodyWeights: weights }, null, 2),
+  [fmt, history, custom, settings, weights]);
 
   const download = () => {
     try {
-      const blob = new Blob([text], { type: fmt === 'csv' ? 'text/csv' : 'application/json' });
+      const blob = new Blob([text], { type: fmt === 'json' ? 'application/json' : 'text/csv' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = 'gym-export-' + new Date().toISOString().slice(0, 10) + '.' + fmt;
+      a.href = url; a.download = (fmt === 'weights' ? 'bodyweight-' : 'gym-') + 'export-' + localDateStr(0) + '.' + (fmt === 'json' ? 'json' : 'csv');
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     } catch (e) {}
@@ -1302,14 +1317,16 @@ function ExportSheet({ history, custom, settings, onClose }) {
     <Sheet title="Export" onClose={onClose}>
       <div style={{ padding: '8px 16px 20px', overflowY: 'auto' }}>
         <div style={{ display: 'flex', gap: 0, background: T.surfaceHi, borderRadius: 10, padding: 3, width: 'fit-content', marginBottom: 10 }}>
-          {[['csv', 'CSV (Excel)'], ['json', 'JSON (full)']].map(([k, l]) => (
+          {[['csv', 'Sets CSV'], ['weights', 'Weight CSV'], ['json', 'JSON']].map(([k, l]) => (
             <button key={k} onClick={() => setFmt(k)} style={{ ...S.segBtn, fontSize: 13, background: fmt === k ? T.gold : 'transparent', color: fmt === k ? '#000' : T.textDim }}>{l}</button>
           ))}
         </div>
         <div style={{ fontSize: 12, color: T.textDim, lineHeight: 1.5, marginBottom: 10 }}>
           {fmt === 'csv'
             ? 'One row per completed set — date, workout, exercise, muscle, weight, reps, volume. Paste straight into Excel or Google Sheets.'
-            : 'Complete backup — settings, custom exercises and full history.'}
+            : fmt === 'weights'
+              ? 'Your body-weight log — one row per entry, ready for Excel.'
+              : 'Complete backup — settings, custom exercises, body weights and full history.'}
         </div>
         <textarea ref={taRef} readOnly value={text} onFocus={e => e.target.select()}
           style={{ width: '100%', height: 220, background: T.surfaceHi, border: '1px solid ' + T.border, borderRadius: 12, color: T.text, fontFamily: FM, fontSize: 11, padding: 12, outline: 'none', resize: 'vertical', boxSizing: 'border-box', whiteSpace: 'pre' }} />
@@ -1383,6 +1400,53 @@ function WeightSheet({ weights, unit, onLog, onDelete, onClose }) {
   );
 }
 
+function SetTypeDialog({ target, onPick, onDelete, onClose }) {
+  if (!target) return null;
+  const Opt = ({ label, sub, onClick, danger }) => (
+    <button onClick={onClick} style={{ width: '100%', textAlign: 'left', background: T.surfaceHi, border: `1px solid ${T.border}`, borderRadius: 12, padding: '13px 14px', marginTop: 8, cursor: 'pointer', fontFamily: FB }}>
+      <div style={{ fontSize: 14.5, fontWeight: 700, color: danger ? T.danger : T.text }}>{label}</div>
+      {sub && <div style={{ fontSize: 11, color: T.textMute, marginTop: 2 }}>{sub}</div>}
+    </button>
+  );
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.72)', display: 'grid', placeItems: 'center', zIndex: 400, padding: 24 }} className="fade-in" onClick={onClose}>
+      <div className="pop-in" style={{ background: T.surfaceMax, border: `1px solid ${T.borderHi}`, borderRadius: 18, padding: '18px 16px 16px', width: '100%', maxWidth: 320 }} onClick={e => e.stopPropagation()}>
+        <div style={{ fontSize: 15, fontWeight: 800, textAlign: 'center' }}>Set {target.si + 1}</div>
+        <Opt label="Working set" onClick={() => onPick(null)} />
+        <Opt label="Warm-up · W" sub="Excluded from volume and records" onClick={() => onPick('W')} />
+        <Opt label="Drop set · D" onClick={() => onPick('D')} />
+        <Opt label="Failure · F" onClick={() => onPick('F')} />
+        <Opt label="Delete set" danger onClick={onDelete} />
+      </div>
+    </div>
+  );
+}
+
+function FinishSheet({ summary, unit, onClose }) {
+  if (!summary) return null;
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.82)', display: 'grid', placeItems: 'center', zIndex: 420, padding: 24 }} className="fade-in" onClick={onClose}>
+      <div className="pop-in" style={{ background: T.surfaceMax, border: `1px solid rgba(212,175,55,.3)`, borderRadius: 22, padding: '26px 22px 20px', width: '100%', maxWidth: 340, textAlign: 'center', boxShadow: '0 24px 80px rgba(0,0,0,.7), 0 0 48px rgba(212,175,55,.09)', position: 'relative', overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+        <div className="gold-sweep" />
+        <div style={{ fontSize: 12, letterSpacing: 2.5, fontWeight: 800, color: T.gold }}>WORKOUT COMPLETE</div>
+        <div style={{ fontSize: 20, fontWeight: 800, marginTop: 8 }}>{summary.name}</div>
+        <div style={{ display: 'flex', justifyContent: 'center', gap: 26, marginTop: 18 }}>
+          {[['DURATION', fmtClock(summary.dur)], ['VOLUME', Math.round(summary.vol).toLocaleString() + ' ' + unit], ['SETS', summary.sets]].map(([l, v]) => (
+            <div key={l}><div style={{ fontFamily: FM, fontSize: 19, fontWeight: 700 }}>{v}</div><div style={{ ...S.statLabel, marginTop: 3 }}>{l}</div></div>
+          ))}
+        </div>
+        {summary.prs.length > 0 && (
+          <div style={{ marginTop: 18, padding: '12px 12px', background: 'rgba(212,175,55,.08)', border: '1px solid rgba(212,175,55,.2)', borderRadius: 14 }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.6, fontWeight: 800, color: T.gold, marginBottom: 8 }}>NEW RECORDS · {summary.prs.length}</div>
+            {summary.prs.map(nm => <div key={nm} style={{ fontSize: 13.5, fontWeight: 600, padding: '3px 0' }}>{nm}</div>)}
+          </div>
+        )}
+        <button style={{ ...S.primaryBtn, marginTop: 20 }} onClick={onClose}>Done</button>
+      </div>
+    </div>
+  );
+}
+
 function ConfirmDialog({ state, onClose }) {
   if (!state) return null;
   return (
@@ -1418,27 +1482,69 @@ function SyncPill({ state }) {
   );
 }
 
+function DailyBanner({ quote }) {
+  const dayIdx = localDayIndex() % Math.max(1, QUOTE_IMAGE_COUNT);
+  const imgSrc = QUOTE_IMG_PATH + (dayIdx + 1) + '.jpg';
+  const [imgOk, setImgOk] = useState(null);
+  useEffect(() => {
+    setImgOk(null);
+    const img = new Image();
+    img.onload  = () => setImgOk(true);
+    img.onerror = () => setImgOk(false);
+    img.src = imgSrc;
+  }, [imgSrc]);
+
+  if (imgOk === true) return (
+    <div className="fade-in" style={{ marginTop: 12, borderRadius: 14, overflow: 'hidden', border: `1px solid ${T.border}`, position: 'relative' }}>
+      <img src={imgSrc} alt="" style={{ width: '100%', display: 'block', maxHeight: 220, objectFit: 'cover', objectPosition: 'top' }} />
+      <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'linear-gradient(transparent, rgba(0,0,0,.88))', padding: '32px 14px 12px' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 7 }}>
+          <Anchor size={12} color={T.gold} style={{ marginTop: 3, flexShrink: 0 }} />
+          <div style={{ fontSize: 12.5, color: '#e8e8ec', fontStyle: 'italic', lineHeight: 1.5, textShadow: '0 1px 6px rgba(0,0,0,.7)' }}>&#8220;{quote}&#8221;</div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="fade-in" style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 12, padding: '12px 14px', background: T.surfaceHi, border: `1px solid ${T.border}`, borderLeft: `3px solid ${T.gold}`, borderRadius: 12 }}>
+      <Anchor size={14} color={T.gold} style={{ marginTop: 2, flexShrink: 0 }} />
+      <div style={{ fontSize: 13.5, color: T.textDim, fontStyle: 'italic', lineHeight: 1.55 }}>&#8220;{quote}&#8221;</div>
+    </div>
+  );
+}
+
 function GarminTab() {
+  const quote = QUOTES[localDayIndex() % QUOTES.length]; // cycles daily at local midnight
   const [offset, setOffset] = useState(0);
   const [cache, setCache] = useState(null);
   const [status, setStatus] = useState('loading');
   const [raw, setRaw] = useState(false);
-  const dateStr = useMemo(() => new Date(Date.now() - offset * 864e5).toISOString().slice(0, 10), [offset]);
+  const dateStr = useMemo(() => localDateStr(offset), [offset]);
 
   useEffect(() => { (async () => setCache(await store.get(K.garmin, {})))(); }, []);
 
   const data = cache ? cache[dateStr] : undefined;
+  const todayStr = localDateStr(0);
+  // stale = today's data was last fetched before the most recent 6:00 AM boundary
+  const stale = (() => {
+    const b = new Date(); b.setHours(6, 0, 0, 0);
+    if (Date.now() < b.getTime()) b.setDate(b.getDate() - 1);
+    return ((cache && cache.__fetchedAt) || 0) < b.getTime();
+  })();
 
   const load = async (force) => {
     if (!cache) return;
-    if (data && !force) { setStatus('ok'); return; }
+    if (data && !force && !(dateStr === todayStr && stale)) { setStatus('ok'); return; }
     setStatus('loading');
     try {
       const r = await fetch('/api/garmin-sync?date=' + dateStr);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const j = await r.json();
       if (!j || j.error) throw new Error((j && j.error) || 'empty');
-      const next = { ...cache, [dateStr]: j };
+      const next = { ...cache, [dateStr]: j, ...(dateStr === todayStr ? { __fetchedAt: Date.now() } : {}) };
+      const cutoff = localDateStr(60);
+      Object.keys(next).forEach(key => { if (/^\d{4}-\d{2}-\d{2}$/.test(key) && key < cutoff) delete next[key]; });
       setCache(next); store.set(K.garmin, next); setStatus('ok');
     } catch (e) { setStatus(data ? 'ok' : 'offline'); }
   };
@@ -1466,17 +1572,28 @@ function GarminTab() {
     <div style={{ padding: '20px 18px 12px' }}>
       <div style={S.h1}>Garmin</div>
       <div style={S.sub}>Daily stats from your Garmin Connect account.</div>
+      <DailyBanner quote={quote} />
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '16px 0 14px' }}>
         <button style={navBtn} onClick={() => setOffset(o => o + 1)} aria-label="Previous day"><ChevronLeft size={16} /></button>
         <div style={{ flex: 1, textAlign: 'center', fontFamily: FM, fontSize: 14, fontWeight: 700, color: isToday ? T.gold : T.text }}>
-          {isToday ? 'Today' : fmtDate(Date.now() - offset * 864e5)}
+          {isToday ? 'Today' : fmtDate(new Date(dateStr + 'T12:00:00').getTime())}
         </div>
         <button style={{ ...navBtn, opacity: isToday ? 0.35 : 1 }} disabled={isToday} onClick={() => setOffset(o => Math.max(0, o - 1))} aria-label="Next day"><ChevronRight size={16} /></button>
         <button style={navBtn} onClick={() => load(true)} aria-label="Refresh"><RefreshCw size={15} /></button>
       </div>
 
-      {status === 'loading' && <div style={S.empty}>Syncing with Garmin…</div>}
+      {dateStr === todayStr && data && cache && cache.__fetchedAt ? (
+        <div style={{ textAlign: 'center', fontSize: 10, color: T.textMute, letterSpacing: 1.2, marginTop: -4, marginBottom: 10, fontFamily: FM }}>
+          AS OF TODAY · UPDATED {new Date(cache.__fetchedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+        </div>
+      ) : null}
+
+      {status === 'loading' && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          {[0, 1, 2, 3].map(i => <div key={i} className="shimmer" style={{ height: 74, borderRadius: 14, border: `1px solid ${T.border}` }} />)}
+        </div>
+      )}
 
       {status === 'offline' && (
         <div style={{ ...S.card, borderLeft: `3px solid ${T.gold}`, padding: '16px 16px' }}>
@@ -1492,7 +1609,7 @@ function GarminTab() {
 
       {status === 'ok' && metrics.length > 0 && (
         <>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          <div className="stagger" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             {metrics.map(([l, v, u]) => (
               <div key={l} style={{ ...S.card, padding: '14px 14px' }}>
                 <div style={S.statLabel}>{l}</div>
@@ -1523,11 +1640,11 @@ function GarminTab() {
 
 function Nav({ tab, setTab, hasActive }) {
   const items = [
+    ['garmin', 'Garmin', Activity],
     ['body', 'Body', PersonStanding],
     ['workout', 'Workout', Dumbbell],
     ['history', 'History', HistoryIcon],
     ['library', 'Library', BookOpen],
-    ['garmin', 'Garmin', Activity],
   ];
   return (
     <div style={S.nav}>
@@ -1540,6 +1657,7 @@ function Nav({ tab, setTab, hasActive }) {
               {id === 'workout' && hasActive && <span style={S.navDot} />}
             </span>
             <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.3 }}>{label}</span>
+            <span style={{ display: 'block', width: 18, height: 3, borderRadius: 2, background: T.gold, transform: on ? 'scaleX(1)' : 'scaleX(0)', transition: 'transform .28s cubic-bezier(.3,.7,.3,1.15)' }} />
           </button>
         );
       })}
@@ -1571,7 +1689,26 @@ function StyleTag() {
     button:active { transform: scale(.96); }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
     .pulse { animation: pulse 2s ease-in-out infinite; }
-    @media (prefers-reduced-motion: reduce) { .view-enter, .slide-up, .fade-in, .check-pop { animation: none !important; } }
+    * { -webkit-tap-highlight-color: transparent; }
+    button, input, textarea, select { touch-action: manipulation; }
+    button { -webkit-user-select: none; user-select: none; }
+    input { font-size: 16px !important; }
+    input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    html, body { overscroll-behavior-y: contain; }
+    .slide-up { animation-duration: .38s; animation-timing-function: cubic-bezier(.26,1.04,.42,1); }
+    @keyframes itemIn { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+    .stagger > * { animation: itemIn .3s cubic-bezier(.2,.7,.3,1) both; }
+    .stagger > *:nth-child(2) { animation-delay: 45ms; } .stagger > *:nth-child(3) { animation-delay: 90ms; }
+    .stagger > *:nth-child(4) { animation-delay: 135ms; } .stagger > *:nth-child(5) { animation-delay: 180ms; }
+    .stagger > *:nth-child(6) { animation-delay: 225ms; } .stagger > *:nth-child(7) { animation-delay: 270ms; }
+    .stagger > *:nth-child(8) { animation-delay: 315ms; }
+    @keyframes flashGold { from { background: rgba(212,175,55,.28); } to { background: rgba(212,175,55,0.07); } }
+    .set-flash { animation: flashGold .55s ease-out; }
+    @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+    .shimmer { background: linear-gradient(100deg, #0d0d11 40%, #17171d 50%, #0d0d11 60%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
+    @keyframes sweep { to { left: 110%; } }
+    .gold-sweep { position: absolute; top: 0; left: -60%; width: 60%; height: 2px; background: linear-gradient(90deg, transparent, #e9d27c, transparent); animation: sweep 1.8s ease-out .15s both; }
+    @media (prefers-reduced-motion: reduce) { .view-enter, .slide-up, .fade-in, .check-pop, .pop-in, .set-flash, .stagger > *, .shimmer, .gold-sweep, .pulse { animation: none !important; } }
     ::-webkit-scrollbar { width: 0; height: 0; }
   `}</style>;
 }
