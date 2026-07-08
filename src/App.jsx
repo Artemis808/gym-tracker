@@ -350,10 +350,10 @@ function ExerciseMedia({ ex, height = 200 }) {
    recency heat, anatomical definition lines.
 ═══════════════════════════════════════════════════════════════════ */
 function heatColor(level) {
-  return [T.heat0, T.heat1, T.heat2, T.heat3][Math.min(3, level)];
+  return ['#1c1c25', T.heat1, T.heat2, T.heat3][Math.min(3, level)];
 }
 
-const BD = { fill: '#0b0b0f', stroke: '#1f1f27', strokeWidth: 1 };
+const BD = { fill: '#101016', stroke: '#2a2a34', strokeWidth: 1 };
 function BodyBase() {
   return (<g {...BD}>
     <circle cx="120" cy="36" r="21" />
@@ -413,7 +413,7 @@ function BodyMap({ view, heat, onSelect, selected }) {
     const sel = selected === id;
     return (
       <g className="mregion" onClick={() => onSelect(id)} style={{ cursor: 'pointer' }} role="button" aria-label={REGION_LABEL[id]}>
-        {d.map((p, i) => <path key={i} d={p} fill={fillFor(id)} stroke={sel ? T.gold : T.borderHi} strokeWidth={sel ? 1.8 : 1} style={{ transition: 'fill .3s ease, stroke .3s ease' }} />)}
+        {d.map((p, i) => <path key={i} d={p} fill={fillFor(id)} stroke={sel ? T.gold : '#31313c'} strokeWidth={sel ? 2.2 : 1} style={{ transition: 'fill .3s ease, stroke .3s ease', filter: sel ? 'drop-shadow(0 0 5px rgba(212,175,55,.55))' : 'none' }} />)}
         {(lines || []).map((p, i) => <path key={'l' + i} d={p} fill="none" stroke="rgba(0,0,0,.42)" strokeWidth="1.1" strokeLinecap="round" />)}
       </g>
     );
@@ -613,6 +613,7 @@ function AppInner() {
   const startWorkout = (name = 'Workout', exMetas = []) => {
     setActive({ id: uid(), name, startTime: Date.now(), exercises: exMetas.map(snapshotEx) });
     setTab('workout');
+    if (!exMetas.length) setSheet({ type: 'bodypick' }); // empty start → pick by muscle on the body
   };
   function snapshotEx(meta) {
     return { key: uid(), n: meta.n, m: meta.m, sm: meta.sm || [], eq: meta.eq, a: meta.a, i: meta.i, img: meta.img,
@@ -707,7 +708,7 @@ function AppInner() {
             active={active} />
         )}
         {tab === 'workout' && (
-          <WorkoutTab active={active} settings={settings} prevFor={prevFor} ask={ask} templates={templates} prBaseline={prBaseline} programIdx={programIdx} suggestFor={(name) => suggestNext(name, history, settings.wInc)} onStartProgram={() => { const day = PROGRAM[programIdx % PROGRAM.length]; startWorkout(day.name, day.exercises); setProgramIdx(i => (i + 1) % PROGRAM.length); }} onSkipProgram={() => setProgramIdx(i => (i + 1) % PROGRAM.length)} onSaveTemplate={() => saveTemplate(active)} onStartTemplate={(t) => startWorkout(t.name, t.exercises)} onDeleteTemplate={(id) => ask('Delete this template?', () => setTemplates(ts => ts.filter(x => x.id !== id)))}
+          <WorkoutTab active={active} settings={settings} prevFor={prevFor} ask={ask} templates={templates} prBaseline={prBaseline} programIdx={programIdx} suggestFor={(name) => suggestNext(name, history, settings.wInc)} onPickBody={() => setSheet({ type: 'bodypick' })} onStartProgram={() => { const day = PROGRAM[programIdx % PROGRAM.length]; startWorkout(day.name, day.exercises); setProgramIdx(i => (i + 1) % PROGRAM.length); }} onSkipProgram={() => setProgramIdx(i => (i + 1) % PROGRAM.length)} onSaveTemplate={() => saveTemplate(active)} onStartTemplate={(t) => startWorkout(t.name, t.exercises)} onDeleteTemplate={(id) => ask('Delete this template?', () => setTemplates(ts => ts.filter(x => x.id !== id)))}
             onStart={() => startWorkout()}
             onAdd={() => setSheet({ type: 'picker' })}
             onRemoveExercise={removeExercise} onUpdateSet={updateSet}
@@ -748,6 +749,9 @@ function AppInner() {
           onOpen={(ex) => setSheet({ type: 'detail', ex, from: 'muscle', region: sheet.region })}
           onStart={(metas) => { active ? addExercises(metas) : startWorkout(REGION_LABEL[sheet.region], metas); setSheet(null); }}
           hasActive={!!active} />
+      )}
+      {sheet?.type === 'bodypick' && (
+        <BodyPickSheet heat={heat} onClose={() => setSheet(null)} onRegion={(region) => setSheet({ type: 'muscle', region, sub: null })} />
       )}
       {sheet?.type === 'picker' && (
         <PickerSheet library={library}
@@ -829,6 +833,7 @@ function BodyTab({ heat, library, weights, unit, onLogWeight, onMuscle, onStart,
   const focus = zoomR ? (FOCUS[zoomR] || { y: 200, s: 2 }) : null;
   if (focus) lastFocus.current = focus;
   const shown = focus || lastFocus.current;
+  const dy = Math.max(-50, Math.min(20, (0.38 - shown.y / 446) * 100)); // land the muscle above the panel
   const subs = zoomR ? (SUBREGIONS[zoomR] || []) : [];
   const countFor = (t) => library.filter(e => e.m === zoomR && t(e.n.toLowerCase())).length;
   const allCount = zoomR ? library.filter(e => e.m === zoomR).length : 0;
@@ -848,14 +853,14 @@ function BodyTab({ heat, library, weights, unit, onLogWeight, onMuscle, onStart,
       )}
 
       <div style={{ perspective: 1200, position: 'relative' }}>
-        <div style={{ position: 'relative', height: 'min(46vh, 400px)', transformStyle: 'preserve-3d', transition: 'transform .6s cubic-bezier(.35,.7,.25,1)', transform: view === 'back' ? 'rotateY(180deg)' : 'rotateY(0deg)', overflow: zoomR ? 'hidden' : 'visible' }}>
+        <div style={{ position: 'relative', height: 'min(46vh, 400px)', transformStyle: 'preserve-3d', transition: 'transform .65s cubic-bezier(.55,.06,.25,1)', willChange: 'transform', transform: view === 'back' ? 'rotateY(180deg)' : 'rotateY(0deg)', overflow: zoomR ? 'hidden' : 'visible' }}>
           <div style={{ position: 'absolute', inset: 0, backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden', pointerEvents: view === 'front' && !zoomR ? 'auto' : 'none' }}>
-            <div style={{ height: '100%', transform: focus && view === 'front' ? `scale(${shown.s})` : 'scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .55s cubic-bezier(.3,.85,.3,1)' }}>
+            <div style={{ height: '100%', transform: focus && view === 'front' ? `translateY(${dy}%) scale(${shown.s})` : 'translateY(0%) scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .6s cubic-bezier(.22,1,.36,1)', willChange: 'transform' }}>
               <BodyMap view="front" heat={heat} selected={zoomR} onSelect={(id) => setZoomR(id)} />
             </div>
           </div>
           <div style={{ position: 'absolute', inset: 0, backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden', transform: 'rotateY(180deg)', pointerEvents: view === 'back' && !zoomR ? 'auto' : 'none' }}>
-            <div style={{ height: '100%', transform: focus && view === 'back' ? `scale(${shown.s})` : 'scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .55s cubic-bezier(.3,.85,.3,1)' }}>
+            <div style={{ height: '100%', transform: focus && view === 'back' ? `translateY(${dy}%) scale(${shown.s})` : 'translateY(0%) scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .6s cubic-bezier(.22,1,.36,1)', willChange: 'transform' }}>
               <BodyMap view="back" heat={heat} selected={zoomR} onSelect={(id) => setZoomR(id)} />
             </div>
           </div>
@@ -911,7 +916,7 @@ function BodyTab({ heat, library, weights, unit, onLogWeight, onMuscle, onStart,
 
 const PROGRAM = [{"name":"Push Day A","exercises":[{"n":"Barbell Bench Press - Medium Grip","m":"chest","sm":["shoulders","triceps"],"eq":"Barbell","a":"presshoriz","i":"Lie back on a flat bench.","img":"Barbell_Bench_Press_-_Medium_Grip"},{"n":"Standing Military Press","m":"shoulders","sm":["triceps"],"eq":"Barbell","a":"pressvert","i":"Start by placing a barbell that is about chest high on a squat rack.","img":"Standing_Military_Press"},{"n":"Incline Dumbbell Press","m":"chest","sm":["shoulders","triceps"],"eq":"Dumbbell","a":"presshoriz","i":"Lie back on an incline bench with a dumbbell in each hand atop your thighs.","img":"Incline_Dumbbell_Press"},{"n":"Side Lateral Raise","m":"shoulders","sm":[],"eq":"Dumbbell","a":"lateralraise","i":"Pick a couple of dumbbells and stand with a straight torso and the dumbbells by your side at arms length with the palms of the hand facing you.","img":"Side_Lateral_Raise"},{"n":"Triceps Pushdown","m":"triceps","sm":[],"eq":"Cable","a":"extension","i":"Attach a straight or angled bar to a high pulley and grab with an overhand grip (palms facing down) at shoulder width.","img":"Triceps_Pushdown"}]},{"name":"Pull Day A","exercises":[{"n":"Barbell Deadlift","m":"lowerback","sm":["calves","forearms","glutes","hamstrings","back","back","quads","traps"],"eq":"Barbell","a":"hinge","i":"Stand in front of a loaded barbell.","img":"Barbell_Deadlift"},{"n":"Pullups","m":"back","sm":["biceps","back"],"eq":"Bodyweight","a":"pullvert","i":"Grab the pull-up bar with the palms facing forward using the prescribed grip.","img":"Pullups"},{"n":"Bent Over Barbell Row","m":"back","sm":["biceps","back","shoulders"],"eq":"Barbell","a":"pullhoriz","i":"Holding a barbell with a pronated grip (palms facing down), bend your knees slightly and bring your torso forward, by bending at the waist, while keeping the back…","img":"Bent_Over_Barbell_Row"},{"n":"Face Pull","m":"shoulders","sm":["back"],"eq":"Cable","a":"rearfly","i":"Facing a high pulley with a rope or dual handles attached, pull the weight directly towards your face, separating your hands as you do so.","img":"Face_Pull"},{"n":"Barbell Curl","m":"biceps","sm":["forearms"],"eq":"Barbell","a":"curl","i":"Stand up with your torso upright while holding a barbell at a shoulder-width grip.","img":"Barbell_Curl"}]},{"name":"Leg Day A","exercises":[{"n":"Barbell Full Squat","m":"quads","sm":["calves","glutes","hamstrings","lowerback"],"eq":"Barbell","a":"squat","i":"This exercise is best performed inside a squat rack for safety purposes.","img":"Barbell_Full_Squat"},{"n":"Romanian Deadlift","m":"hamstrings","sm":["calves","glutes","lowerback"],"eq":"Barbell","a":"hinge","i":"Put a barbell in front of you on the ground and grab it using a pronated (palms facing down) grip that a little wider than shoulder width.","img":"Romanian_Deadlift"},{"n":"Leg Press","m":"quads","sm":["calves","glutes","hamstrings"],"eq":"Machine","a":"squat","i":"Using a leg press machine, sit down on the machine and place your legs on the platform directly in front of you at a medium (shoulder width) foot stance.","img":"Leg_Press"},{"n":"Lying Leg Curls","m":"hamstrings","sm":[],"eq":"Machine","a":"legcurl","i":"Adjust the machine lever to fit your height and lie face down on the leg curl machine with the pad of the lever on the back of your legs (just a few inches under the calves).","img":"Lying_Leg_Curls"},{"n":"Standing Calf Raises","m":"calves","sm":[],"eq":"Machine","a":"calf","i":"Adjust the padded lever of the calf raise machine to fit your height.","img":"Standing_Calf_Raises"},{"n":"Crunches","m":"abs","sm":[],"eq":"Bodyweight","a":"ab","i":"Lie flat on your back with your feet flat on the ground, or resting on a bench with your knees bent at a 90 degree angle.","img":"Crunches"}]},{"name":"Push Day B","exercises":[{"n":"Seated Dumbbell Press","m":"shoulders","sm":["triceps"],"eq":"Dumbbell","a":"pressvert","i":"Grab a couple of dumbbells and sit on a military press bench or a utility bench that has a back support on it as you place the dumbbells upright on top of your thighs.","img":"Seated_Dumbbell_Press"},{"n":"Dumbbell Bench Press","m":"chest","sm":["shoulders","triceps"],"eq":"Dumbbell","a":"presshoriz","i":"Lie down on a flat bench with a dumbbell in each hand resting on top of your thighs.","img":"Dumbbell_Bench_Press"},{"n":"Cable Crossover","m":"chest","sm":["shoulders"],"eq":"Cable","a":"fly","i":"To get yourself into the starting position, place the pulleys on a high position (above your head), select the resistance to be used and hold the pulleys in each hand.","img":"Cable_Crossover"},{"n":"Front Dumbbell Raise","m":"shoulders","sm":[],"eq":"Dumbbell","a":"pressvert","i":"Pick a couple of dumbbells and stand with a straight torso and the dumbbells on front of your thighs at arms length with the palms of the hand facing your thighs.","img":"Front_Dumbbell_Raise"},{"n":"Lying Triceps Press","m":"triceps","sm":[],"eq":"EZ Bar","a":"extension","i":"Lie on a flat bench with either an e-z bar (my preference) or a straight bar placed on the floor behind your head and your feet on the floor.","img":"Lying_Triceps_Press"},{"n":"Dips - Triceps Version","m":"triceps","sm":["chest","shoulders"],"eq":"Bodyweight","a":"extension","i":"To get into the starting position, hold your body at arm's length with your arms nearly locked above the bars.","img":"Dips_-_Triceps_Version"}]},{"name":"Pull Day B","exercises":[{"n":"T-Bar Row with Handle","m":"back","sm":["biceps","back"],"eq":"Barbell","a":"pullhoriz","i":"Position a bar into a landmine or in a corner to keep it from moving.","img":"T-Bar_Row_with_Handle"},{"n":"Wide-Grip Lat Pulldown","m":"back","sm":["biceps","back","shoulders"],"eq":"Cable","a":"pullvert","i":"Sit down on a pull-down machine with a wide bar attached to the top pulley.","img":"Wide-Grip_Lat_Pulldown"},{"n":"Seated Cable Rows","m":"back","sm":["biceps","back","shoulders"],"eq":"Cable","a":"pullhoriz","i":"For this exercise you will need access to a low pulley row machine with a V-bar.","img":"Seated_Cable_Rows"},{"n":"Barbell Shrug","m":"traps","sm":[],"eq":"Barbell","a":"shrug","i":"Stand up straight with your feet at shoulder width as you hold a barbell with both hands in front of you using a pronated grip (palms facing the thighs).","img":"Barbell_Shrug"},{"n":"Hammer Curls","m":"biceps","sm":[],"eq":"Dumbbell","a":"curl","i":"Stand up with your torso upright and a dumbbell on each hand being held at arms length.","img":"Hammer_Curls"}]},{"name":"Leg Day B","exercises":[{"n":"Front Barbell Squat","m":"quads","sm":["calves","glutes","hamstrings"],"eq":"Barbell","a":"squat","i":"This exercise is best performed inside a squat rack for safety purposes.","img":"Front_Barbell_Squat"},{"n":"Barbell Lunge","m":"quads","sm":["calves","glutes","hamstrings"],"eq":"Barbell","a":"lunge","i":"This exercise is best performed inside a squat rack for safety purposes.","img":"Barbell_Lunge"},{"n":"Leg Extensions","m":"quads","sm":[],"eq":"Machine","a":"legext","i":"For this exercise you will need to use a leg extension machine.","img":"Leg_Extensions"},{"n":"Seated Leg Curl","m":"hamstrings","sm":[],"eq":"Machine","a":"legcurl","i":"Adjust the machine lever to fit your height and sit on the machine with your back against the back support pad.","img":"Seated_Leg_Curl"},{"n":"Seated Calf Raise","m":"calves","sm":[],"eq":"Machine","a":"calf","i":"Sit on the machine and place your toes on the lower portion of the platform provided with the heels extending off.","img":"Seated_Calf_Raise"},{"n":"Hanging Leg Raise","m":"abs","sm":[],"eq":"Bodyweight","a":"ab","i":"Hang from a chin-up bar with both arms extended at arms length in top of you using either a wide grip or a medium grip.","img":"Hanging_Leg_Raise"}]}];
 
-function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, programIdx, suggestFor, onStartProgram, onSkipProgram, onSaveTemplate, onStartTemplate, onDeleteTemplate, onStart, onAdd, onRemoveExercise, onUpdateSet, onAddSet, onRemoveSet, onSetType, onSetRpe, onExNote, onToggleDone, onRename, onFinish, onCancel, onOpenDetail }) {
+function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, programIdx, suggestFor, onStartProgram, onSkipProgram, onSaveTemplate, onStartTemplate, onDeleteTemplate, onStart, onAdd, onPickBody, onRemoveExercise, onUpdateSet, onAddSet, onRemoveSet, onSetType, onSetRpe, onExNote, onToggleDone, onRename, onFinish, onCancel, onOpenDetail }) {
   const [typeTarget, setTypeTarget] = useState(null);
   if (!active) {
     return (
@@ -971,7 +976,8 @@ function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, pro
             onAddSet={() => onAddSet(ei)} onNumTap={(si) => setTypeTarget({ ei, si })} onNote={(v) => onExNote(ei, v)}
             onToggle={(si) => onToggleDone(ei, si)} />
         ))}
-        <button style={S.dashBtn} onClick={onAdd}>+ Add exercise</button>
+        <button style={S.dashBtn} onClick={onPickBody}>+ Add exercise</button>
+        <button onClick={onAdd} style={{ width: '100%', background: 'none', border: 'none', color: T.textMute, fontSize: 12, fontWeight: 600, padding: '10px 0 0', cursor: 'pointer', fontFamily: FB, textDecoration: 'underline' }}>Search the full list instead</button>
         <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
           <button style={S.ghostBtn} onClick={onCancel}>Discard</button>
           <button style={S.finishBtn} onClick={onFinish}>Finish</button>
@@ -1287,29 +1293,34 @@ function PhotosView({ photos, onAdd, onDel }) {
   const [compare, setCompare] = useState(false);
   const fileRef = useRef(null);
   const sorted = [...(photos || [])].sort((a, b) => a.ts - b.ts);
+  const compress = (file) => new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, 520 / Math.max(img.width, img.height));
+      const cnv = document.createElement('canvas');
+      cnv.width = Math.round(img.width * k); cnv.height = Math.round(img.height * k);
+      cnv.getContext('2d').drawImage(img, 0, 0, cnv.width, cnv.height);
+      res(cnv.toDataURL('image/jpeg', 0.62));
+    };
+    img.onerror = rej;
+    img.src = URL.createObjectURL(file);
+  });
   const upload = async (file) => {
     if (!file) return;
     setBusy(true);
     try {
-      const fd = new FormData();
-      fd.append('file', file);
-      fd.append('upload_preset', CLOUDINARY.preset);
-      const r = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY.cloud}/image/upload`, { method: 'POST', body: fd });
-      const j = await r.json();
-      if (j && j.secure_url) onAdd({ id: uid(), ts: Date.now(), url: j.secure_url });
+      if (CLOUD_READY) {
+        const fd = new FormData(); fd.append('file', file); fd.append('upload_preset', CLOUDINARY.preset);
+        const r = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY.cloud}/image/upload`, { method: 'POST', body: fd });
+        const j = await r.json();
+        if (j && j.secure_url) { onAdd({ id: uid(), ts: Date.now(), url: j.secure_url }); setBusy(false); return; }
+      }
+      // no setup needed: compress on-device and sync through Firebase like everything else
+      const dataUrl = await compress(file);
+      onAdd({ id: uid(), ts: Date.now(), url: dataUrl });
     } catch (e) {}
     setBusy(false);
   };
-  if (!CLOUD_READY) return (
-    <div style={{ ...S.card, borderLeft: `3px solid ${T.gold}`, padding: '16px' }}>
-      <div style={{ fontWeight: 800, fontSize: 15, color: T.gold }}>Set up progress photos</div>
-      <p style={{ fontSize: 13, color: T.textDim, lineHeight: 1.65, margin: '8px 0 0' }}>
-        Uses your existing Cloudinary account (same as the wedding tracker). In the Cloudinary console:
-        Settings → Upload → Add upload preset → Signing mode: <b>Unsigned</b> → save. Then in src/App.jsx,
-        find the CLOUDINARY constant near the top and paste your cloud name and the preset name. Commit — done.
-      </p>
-    </div>
-  );
   return (
     <div>
       <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: 'none' }} onChange={e => { upload(e.target.files && e.target.files[0]); e.target.value = ''; }} />
@@ -1475,6 +1486,23 @@ function Sheet({ title, onClose, action, children }) {
         {children}
       </div>
     </div>
+  );
+}
+
+function BodyPickSheet({ heat, onClose, onRegion }) {
+  const [view, setView] = useState('front');
+  return (
+    <Sheet title="Pick by muscle" onClose={onClose}>
+      <div style={{ display: 'flex', justifyContent: 'center', margin: '4px auto 6px', width: 'fit-content', background: T.surfaceHi, borderRadius: 10, padding: 3 }}>
+        {['front', 'back'].map(v => (
+          <button key={v} onClick={() => setView(v)} style={{ ...S.segBtn, background: view === v ? T.gold : 'transparent', color: view === v ? '#000' : T.textDim }}>{v === 'front' ? 'Front' : 'Back'}</button>
+        ))}
+      </div>
+      <div style={{ height: 'min(52vh, 430px)', padding: '0 10px 6px' }}>
+        <BodyMap view={view} heat={heat} onSelect={onRegion} />
+      </div>
+      <div style={{ textAlign: 'center', fontSize: 10.5, color: T.textMute, letterSpacing: 1, paddingBottom: 16 }}>TAP A MUSCLE TO SEE ITS EXERCISES</div>
+    </Sheet>
   );
 }
 
@@ -2300,6 +2328,13 @@ function GarminTab({ food, history }) {
               </div>
             ))}
           </div>
+      {data && metrics.length <= 1 && (
+        <div className="fade-in" style={{ ...S.card, borderLeft: `3px solid ${T.gold}`, padding: '12px 14px', margin: '10px 0 0' }}>
+          <div style={{ fontSize: 12.5, color: T.textDim, lineHeight: 1.6 }}>
+            Connected, but Garmin returned no metrics for this day. Open the Garmin Connect app on your phone so the watch syncs, wait a minute, then tap ↻. If it stays empty, Vercel → project → Logs shows the reason, and the raw response below shows which source replied.
+          </div>
+        </div>
+      )}
           <button style={{ background: 'none', border: 'none', color: T.textMute, fontSize: 12, padding: '12px 2px', cursor: 'pointer', fontFamily: FB }} onClick={() => setRaw(r => !r)}>
             {raw ? 'Hide raw response' : 'View raw response'}
           </button>
