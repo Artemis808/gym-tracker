@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { PersonStanding, Dumbbell, History as HistoryIcon, BookOpen, Settings as SettingsIcon, MoreHorizontal, Check, Circle, Plus, Minus, ChevronRight, ChevronDown, ChevronLeft, X, Activity, RefreshCw, Cloud, CloudOff, Anchor } from 'lucide-react';
+import { PersonStanding, Dumbbell, History as HistoryIcon, BookOpen, Settings as SettingsIcon, MoreHorizontal, Check, Circle, Plus, Minus, ChevronRight, ChevronDown, ChevronLeft, X, Activity, RefreshCw, Cloud, CloudOff, Anchor, Flame, Trophy } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getDatabase, ref as dbRef, onValue, set as dbSet, goOnline } from 'firebase/database';
 import { firebaseConfig } from './firebase.js';
@@ -61,7 +61,7 @@ const REGION_LABEL = Object.fromEntries(REGIONS.map(r => [r.id, r.label]));
 /* ════════════════════════════════════════════════════════════════
    STORAGE
 ═══════════════════════════════════════════════════════════════════ */
-const K = { history: 'gymx:history', active: 'gymx:active', settings: 'gymx:settings', rest: 'gymx:rest', custom: 'gymx:custom', templates: 'gymx:templates', weights: 'gymx:weights', garmin: 'gymx:garmin', program: 'gymx:program', schema: 'gymx:schema' };
+const K = { history: 'gymx:history', active: 'gymx:active', settings: 'gymx:settings', rest: 'gymx:rest', custom: 'gymx:custom', templates: 'gymx:templates', weights: 'gymx:weights', garmin: 'gymx:garmin', program: 'gymx:program', food: 'gymx:food', photos: 'gymx:photos', schema: 'gymx:schema' };
 /* ────────────────────────────────────────────────────────────────
    STORAGE BACKEND
    Three modes, auto-selected:
@@ -72,6 +72,11 @@ const K = { history: 'gymx:history', active: 'gymx:active', settings: 'gymx:sett
    • localStorage          — deployed without a Firebase config (single device).
    The app talks only to `store`; the backend underneath is swappable.
 ──────────────────────────────────────────────────────────────── */
+// Progress photos — create an UNSIGNED upload preset in your Cloudinary console
+// (same account as the wedding tracker), then paste cloud name + preset here.
+const CLOUDINARY = { cloud: 'PASTE_CLOUD_NAME', preset: 'PASTE_UNSIGNED_PRESET' };
+const CLOUD_READY = !/PASTE_/.test(CLOUDINARY.cloud + CLOUDINARY.preset);
+
 const FB_READY = typeof firebaseConfig === 'object' && firebaseConfig && !/PASTE_YOUR/.test(firebaseConfig.databaseURL || '') && !!firebaseConfig.databaseURL;
 
 // connection/sync status broadcast to the UI
@@ -186,6 +191,91 @@ const bestBefore = (name, history, beforeTs) => {
   }
   return best;
 };
+const dateStrOf = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+
+// Auto-progression: double progression on the last top working set
+function suggestNext(name, history, wInc) {
+  const ss = sessionsFor(name, history); const last = ss[ss.length - 1];
+  if (!last || !last.top) return null;
+  const w = Number(last.top.w) || 0, r = Number(last.top.r) || 0;
+  if (!w || !r) return null;
+  if (r >= 10) return { w: Math.round((w + (wInc || 2.5)) * 2) / 2, r: 8, why: 'reps ceiling — add load' };
+  if (r >= 6) return { w, r: r + 1, why: 'add a rep' };
+  return { w, r, why: 'consolidate' };
+}
+
+// Actual rep-maxes: best weight lifted at each rep count (working sets only)
+function recordsFor(name, history) {
+  const best = {};
+  (history || []).forEach(wk => {
+    const ex = wk.exercises.find(e => e.n === name); if (!ex) return;
+    (ex.sets || []).forEach(s => {
+      if (s.t === 'W') return; const r = Number(s.r) || 0, w = Number(s.w) || 0;
+      if (!r || !w) return;
+      if (!best[r] || w > best[r].w) best[r] = { w, ts: wk.startTime };
+    });
+  });
+  return best;
+}
+
+// Working sets per muscle over a trailing window
+function setsPerMuscle(history, days = 7) {
+  const cut = Date.now() - days * 864e5; const out = {};
+  (history || []).forEach(w => {
+    if (w.startTime < cut) return;
+    w.exercises.forEach(ex => { out[ex.m] = (out[ex.m] || 0) + (ex.sets || []).filter(s => s.t !== 'W').length; });
+  });
+  return out;
+}
+
+const trainedDays = (history) => { const s = new Set(); (history || []).forEach(w => s.add(dateStrOf(w.startTime))); return s; };
+function weekStreak(history, min = 3) {
+  const days = trainedDays(history); let streak = 0;
+  for (let wk = 0; wk < 104; wk++) {
+    let c = 0; for (let d = 0; d < 7; d++) if (days.has(localDateStr(wk * 7 + d))) c++;
+    if (c >= min) streak++; else break;
+  }
+  return streak;
+}
+
+// Adaptive TDEE: mean intake minus weight-trend energy (7700 kcal/kg)
+function computeTDEE(food, weights) {
+  const days = Object.keys(food || {}).filter(k => /^\d{4}/.test(k)).sort().slice(-21);
+  const intake = days.map(d => (food[d] || []).reduce((a, e) => a + (+e.kcal || 0), 0)).filter(v => v >= 800);
+  const ws = (weights || []).filter(w => Date.now() - w.ts < 28 * 864e5);
+  if (intake.length < 7 || ws.length < 4) return { ready: false, needDays: Math.max(0, 7 - intake.length), needWs: Math.max(0, 4 - ws.length) };
+  const avgIn = intake.reduce((a, b) => a + b, 0) / intake.length;
+  const t0 = ws[0].ts, xs = ws.map(w => (w.ts - t0) / 864e5), ys = ws.map(w => w.v);
+  const n = xs.length, sx = xs.reduce((a, b) => a + b, 0), sy = ys.reduce((a, b) => a + b, 0);
+  const sxy = xs.reduce((a, x, i) => a + x * ys[i], 0), sxx = xs.reduce((a, x) => a + x * x, 0);
+  const slope = (n * sxy - sx * sy) / Math.max(1e-9, n * sxx - sx * sx);
+  return { ready: true, tdee: Math.round(avgIn - slope * 7700), ratePerWk: slope * 7, days: intake.length };
+}
+
+// Morning readiness from sleep, body battery, and yesterday's load
+function readinessFrom(g, history) {
+  if (!g) return null;
+  const digR = (o, p) => p.split('.').reduce((x, k) => (x == null ? x : x[k]), o);
+  const sleep = digR(g, 'sleep.score') ?? g.sleepScore;
+  const bb = digR(g, 'bodyBattery.high') ?? g.bodyBatteryHighestValue;
+  if (sleep == null && bb == null) return null;
+  let score = 0, wsum = 0;
+  if (sleep != null) { score += sleep * 0.55; wsum += 0.55; }
+  if (bb != null) { score += bb * 0.45; wsum += 0.45; }
+  score = score / (wsum || 1);
+  const yVol = (history || []).filter(w => dateStrOf(w.startTime) === localDateStr(1)).reduce((a, w) => a + vol(w), 0);
+  const sess = (history || []).slice(-12);
+  const avg = sess.length ? sess.reduce((a, w) => a + vol(w), 0) / sess.length : 0;
+  const heavyYest = avg > 0 && yVol > 1.25 * avg;
+  if (heavyYest) score -= 10;
+  const verdict = score >= 70 ? 'PUSH' : score >= 45 ? 'MAINTAIN' : 'RECOVER';
+  const reason = sleep != null && sleep < 60 ? 'Sleep ran light — keep intensity honest.'
+    : bb != null && bb < 50 ? 'Body battery is low — quality over quantity.'
+    : heavyYest ? 'Big session yesterday — leave a rep in the tank.'
+    : 'Recovery looks solid — attack it.';
+  return { verdict, score: Math.round(score), reason };
+}
+
 // Chronological best-e1RM per session for one exercise (warm-ups excluded)
 const sessionsFor = (name, history) => {
   const out = [];
@@ -263,91 +353,147 @@ function heatColor(level) {
   return [T.heat0, T.heat1, T.heat2, T.heat3][Math.min(3, level)];
 }
 
-const BD = { fill: '#0b0b0f', stroke: '#1e1e25', strokeWidth: 1 };
+const BD = { fill: '#0b0b0f', stroke: '#1f1f27', strokeWidth: 1 };
 function BodyBase() {
   return (<g {...BD}>
-    <circle cx="120" cy="38" r="22" />
-    <path d="M106,58 L134,58 L139,78 L101,78 Z" />
-    <path d="M84,80 C79,130 85,182 98,216 L142,216 C155,182 161,130 156,80 C132,69 108,69 84,80 Z" />
-    <path d="M95,213 L145,213 C150,228 147,241 138,247 L102,247 C93,241 90,228 95,213 Z" />
-    <path d="M61,88 C46,99 41,124 44,157 L40,205 C39,219 51,225 57,215 L65,165 C69,134 70,107 61,88 Z" />
-    <path d="M179,88 C194,99 199,124 196,157 L200,205 C201,219 189,225 183,215 L175,165 C171,134 170,107 179,88 Z" />
-    <ellipse cx="44" cy="228" rx="9" ry="12" />
-    <ellipse cx="196" cy="228" rx="9" ry="12" />
-    <path d="M96,244 C87,300 89,362 97,420 L114,420 C115,362 116,300 117,248 Z" />
-    <path d="M144,244 C153,300 151,362 143,420 L126,420 C125,362 124,300 123,248 Z" />
-    <ellipse cx="104" cy="430" rx="12" ry="8" />
-    <ellipse cx="136" cy="430" rx="12" ry="8" />
+    <circle cx="120" cy="36" r="21" />
+    <path d="M106,56 L134,56 L137,76 L103,76 Z" />
+    <path d="M84,78 C82,120 86,168 97,212 L143,212 C154,168 158,120 156,78 C134,68 106,68 84,78 Z" />
+    <path d="M96,210 L144,210 C149,224 146,238 137,245 L103,245 C94,238 91,224 96,210 Z" />
+    <path d="M62,86 C46,96 41,122 44,158 L40,206 C39,220 51,226 57,216 L65,166 C69,134 70,106 62,86 Z" />
+    <path d="M178,86 C194,96 199,122 196,158 L200,206 C201,220 189,226 183,216 L175,166 C171,134 170,106 178,86 Z" />
+    <ellipse cx="44" cy="229" rx="9" ry="12" />
+    <ellipse cx="196" cy="229" rx="9" ry="12" />
+    <path d="M95,242 C86,300 88,362 96,420 L114,420 C115,362 116,300 117,246 Z" />
+    <path d="M145,242 C154,300 152,362 144,420 L126,420 C125,362 124,300 123,246 Z" />
+    <ellipse cx="103" cy="431" rx="12" ry="8" />
+    <ellipse cx="137" cy="431" rx="12" ry="8" />
   </g>);
 }
 
-function BodyMap({ view, heat, onSelect }) {
+// Zoom focal points (viewBox y-centre + scale) per region
+const FOCUS = {
+  traps: { y: 82, s: 2.5 }, shoulders: { y: 104, s: 2.2 }, chest: { y: 114, s: 2.3 },
+  biceps: { y: 147, s: 2.3 }, triceps: { y: 147, s: 2.3 }, forearms: { y: 194, s: 2.3 },
+  abs: { y: 175, s: 2.3 }, back: { y: 145, s: 2.2 }, lowerback: { y: 201, s: 2.5 },
+  glutes: { y: 236, s: 2.4 }, quads: { y: 288, s: 1.9 }, hamstrings: { y: 296, s: 2.0 },
+  calves: { y: 375, s: 2.0 },
+};
+
+// Drill-down heads per muscle — keyword tests run on lowercase exercise names
+const SUBREGIONS = {
+  chest: [
+    { id: 'upper', label: 'Upper chest', test: (n) => /incline/.test(n) },
+    { id: 'mid', label: 'Mid chest', test: (n) => !/incline|decline|dip/.test(n) },
+    { id: 'lower', label: 'Lower chest', test: (n) => /decline|dip/.test(n) },
+  ],
+  shoulders: [
+    { id: 'front', label: 'Front delts', test: (n) => /press|front raise|arnold|jerk/.test(n) },
+    { id: 'side', label: 'Side delts', test: (n) => /lateral|upright/.test(n) },
+    { id: 'rear', label: 'Rear delts', test: (n) => /rear|reverse fl|face pull/.test(n) },
+  ],
+  back: [
+    { id: 'lats', label: 'Lats · width', test: (n) => /pulldown|pull-up|pullup|pull up|chin|pullover/.test(n) },
+    { id: 'rows', label: 'Mid-back · rows', test: (n) => /row/.test(n) },
+  ],
+  abs: [
+    { id: 'upper', label: 'Upper abs', test: (n) => /crunch|sit/.test(n) },
+    { id: 'lower', label: 'Lower abs', test: (n) => /leg raise|knee raise|reverse|v-up|toes|hip/.test(n) },
+    { id: 'obliques', label: 'Obliques', test: (n) => /twist|oblique|side bend|woodchop/.test(n) },
+  ],
+  quads: [
+    { id: 'quads', label: 'Quadriceps', test: (n) => !/adduct/.test(n) },
+    { id: 'inner', label: 'Inner thigh', test: (n) => /adduct/.test(n) },
+  ],
+};
+
+function BodyMap({ view, heat, onSelect, selected }) {
   const fillFor = (id) => heatColor(heat[id] || 0);
-  const Region = ({ id, d, lines }) => (
-    <g onClick={() => onSelect(id)} style={{ cursor: 'pointer' }} role="button" aria-label={REGION_LABEL[id]}>
-      {d.map((p, i) => <path key={i} d={p} fill={fillFor(id)} stroke={T.borderHi} strokeWidth="1" style={{ transition: 'fill .3s ease' }} />)}
-      {(lines || []).map((p, i) => <path key={'l' + i} d={p} fill="none" stroke="rgba(0,0,0,.45)" strokeWidth="1.5" strokeLinecap="round" />)}
-    </g>
-  );
+  const Region = ({ id, d, lines }) => {
+    const sel = selected === id;
+    return (
+      <g className="mregion" onClick={() => onSelect(id)} style={{ cursor: 'pointer' }} role="button" aria-label={REGION_LABEL[id]}>
+        {d.map((p, i) => <path key={i} d={p} fill={fillFor(id)} stroke={sel ? T.gold : T.borderHi} strokeWidth={sel ? 1.8 : 1} style={{ transition: 'fill .3s ease, stroke .3s ease' }} />)}
+        {(lines || []).map((p, i) => <path key={'l' + i} d={p} fill="none" stroke="rgba(0,0,0,.42)" strokeWidth="1.1" strokeLinecap="round" />)}
+      </g>
+    );
+  };
 
   if (view === 'front') return (
     <svg viewBox="0 0 240 446" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style={{ display: 'block', margin: '0 auto' }}>
       <BodyBase />
-      <Region id="traps" d={["M97,70 Q120,60 143,70 L149,87 Q120,75 91,87 Z"]} />
+      <Region id="traps" d={["M96,70 Q120,58 144,70 L150,86 Q120,73 90,86 Z"]}
+        lines={["M104,70 L98,84", "M120,64 L120,80", "M136,70 L142,84"]} />
       <Region id="shoulders" d={[
-        "M54,92 C64,83 80,85 86,96 C89,109 81,121 67,121 C54,118 49,104 54,92 Z",
-        "M186,92 C176,83 160,85 154,96 C151,109 159,121 173,121 C186,118 191,104 186,92 Z"]} />
+        "M53,90 C63,80 80,83 86,95 C89,109 81,122 66,122 C53,119 48,103 53,90 Z",
+        "M187,90 C177,80 160,83 154,95 C151,109 159,122 174,122 C187,119 192,103 187,90 Z"]}
+        lines={["M60,90 Q58,105 63,117", "M70,86 Q69,103 71,118", "M79,89 Q78,104 77,116",
+                "M180,90 Q182,105 177,117", "M170,86 Q171,103 169,118", "M161,89 Q162,104 163,116"]} />
       <Region id="chest" d={[
-        "M89,93 C103,87 117,89 118,96 L118,137 C105,146 90,140 86,127 C83,114 84,101 89,93 Z",
-        "M151,93 C137,87 123,89 122,96 L122,137 C135,146 150,140 154,127 C157,114 156,101 151,93 Z"]}
-        lines={["M92,130 Q105,138 117,133", "M148,130 Q135,138 123,133"]} />
+        "M89,92 C104,85 117,88 118,96 L118,138 C104,148 89,141 85,127 C82,113 84,99 89,92 Z",
+        "M151,92 C136,85 123,88 122,96 L122,138 C136,148 151,141 155,127 C158,113 156,99 151,92 Z"]}
+        lines={["M117,100 Q102,98 90,102", "M117,112 Q101,111 88,116", "M117,124 Q102,125 89,129",
+                "M123,100 Q138,98 150,102", "M123,112 Q139,111 152,116", "M123,124 Q138,125 151,129",
+                "M92,131 Q105,140 117,134", "M148,131 Q135,140 123,134"]} />
       <Region id="biceps" d={[
-        "M51,123 C61,120 68,127 67,138 L61,169 C53,174 46,167 46,155 C45,143 47,131 51,123 Z",
-        "M189,123 C179,120 172,127 173,138 L179,169 C187,174 194,167 194,155 C195,143 193,131 189,123 Z"]} />
+        "M51,124 C61,120 68,127 67,139 L61,170 C53,175 46,168 46,156 C45,144 47,131 51,124 Z",
+        "M189,124 C179,120 172,127 173,139 L179,170 C187,175 194,168 194,156 C195,144 193,131 189,124 Z"]}
+        lines={["M53,130 Q52,150 56,166", "M60,127 Q59,149 61,167", "M187,130 Q188,150 184,166", "M180,127 Q181,149 179,167"]} />
       <Region id="forearms" d={[
-        "M47,175 L61,173 L56,214 C51,221 44,217 43,208 Z",
-        "M193,175 L179,173 L184,214 C189,221 196,217 197,208 Z"]} />
-      <Region id="abs" d={["M102,142 C113,137 127,137 138,142 L135,209 Q120,217 105,209 Z"]}
-        lines={["M120,143 L120,209", "M106,160 L134,160", "M105,176 L135,176", "M106,192 L134,192"]} />
+        "M47,176 L61,174 L56,215 C51,222 44,218 43,209 Z",
+        "M193,176 L179,174 L184,215 C189,222 196,218 197,209 Z"]}
+        lines={["M50,180 L48,208", "M56,179 L53,210", "M190,180 L192,208", "M184,179 L187,210"]} />
+      <Region id="abs" d={["M102,142 C113,136 127,136 138,142 L136,208 Q120,217 104,208 Z"]}
+        lines={["M120,142 L120,208", "M105,158 L135,158", "M104,173 L136,173", "M105,188 L135,188",
+                "M101,150 Q97,176 103,202", "M139,150 Q143,176 137,202"]} />
       <Region id="quads" d={[
-        "M97,250 C107,245 114,247 116,254 L113,330 C104,339 93,332 90,317 C87,293 91,267 97,250 Z",
-        "M143,250 C133,245 126,247 124,254 L127,330 C136,339 147,332 150,317 C153,293 149,267 143,250 Z"]}
-        lines={["M103,262 Q100,300 102,322", "M137,262 Q140,300 138,322"]} />
+        "M97,249 C107,243 115,246 117,254 L114,330 C104,340 92,333 89,317 C86,292 90,266 97,249 Z",
+        "M143,249 C133,243 125,246 123,254 L126,330 C136,340 148,333 151,317 C154,292 150,266 143,249 Z"]}
+        lines={["M104,256 Q101,292 103,324", "M96,262 Q92,296 95,318", "M111,296 Q113,314 108,328",
+                "M136,256 Q139,292 137,324", "M144,262 Q148,296 145,318", "M129,296 Q127,314 132,328"]} />
       <Region id="calves" d={[
-        "M96,340 C104,335 110,339 109,348 L106,409 C100,416 93,409 92,396 C90,377 92,356 96,340 Z",
-        "M144,340 C136,335 130,339 131,348 L134,409 C140,416 147,409 148,396 C150,377 148,356 144,340 Z"]} />
+        "M96,340 C104,334 111,338 110,348 L107,410 C100,417 92,410 91,396 C89,377 92,355 96,340 Z",
+        "M144,340 C136,334 129,338 130,348 L133,410 C140,417 148,410 149,396 C151,377 148,355 144,340 Z"]}
+        lines={["M98,348 Q96,378 98,402", "M105,346 Q104,378 103,404", "M142,348 Q144,378 142,402", "M135,346 Q136,378 137,404"]} />
     </svg>
   );
 
   return (
     <svg viewBox="0 0 240 446" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style={{ display: 'block', margin: '0 auto' }}>
       <BodyBase />
-      <Region id="traps" d={["M120,60 L150,79 L133,127 Q120,118 107,127 L90,79 Z"]} lines={["M120,72 L120,118"]} />
+      <Region id="traps" d={["M120,58 L152,78 L134,128 Q120,118 106,128 L88,78 Z"]}
+        lines={["M120,66 L120,120", "M106,76 L116,112", "M134,76 L124,112"]} />
       <Region id="shoulders" d={[
-        "M54,92 C64,83 80,85 86,96 C89,109 81,121 67,121 C54,118 49,104 54,92 Z",
-        "M186,92 C176,83 160,85 154,96 C151,109 159,121 173,121 C186,118 191,104 186,92 Z"]} />
+        "M53,90 C63,80 80,83 86,95 C89,109 81,122 66,122 C53,119 48,103 53,90 Z",
+        "M187,90 C177,80 160,83 154,95 C151,109 159,122 174,122 C187,119 192,103 187,90 Z"]}
+        lines={["M60,90 Q58,105 63,117", "M70,86 Q69,103 71,118", "M180,90 Q182,105 177,117", "M170,86 Q171,103 169,118"]} />
       <Region id="back" d={[
-        "M91,107 C101,102 116,106 118,114 L118,182 C103,191 88,176 85,150 C83,133 85,117 91,107 Z",
-        "M149,107 C139,102 124,106 122,114 L122,182 C137,191 152,176 155,150 C157,133 155,117 149,107 Z"]}
-        lines={["M120,108 L120,184"]} />
+        "M90,106 C101,100 116,105 118,113 L118,184 C102,193 86,177 83,150 C81,132 83,116 90,106 Z",
+        "M150,106 C139,100 124,105 122,113 L122,184 C138,193 154,177 157,150 C159,132 157,116 150,106 Z"]}
+        lines={["M115,120 Q98,132 90,148", "M116,138 Q100,150 92,164", "M116,158 Q104,168 97,176",
+                "M125,120 Q142,132 150,148", "M124,138 Q140,150 148,164", "M124,158 Q136,168 143,176"]} />
       <Region id="triceps" d={[
-        "M51,123 C61,120 68,127 67,138 L61,169 C53,174 46,167 46,155 C45,143 47,131 51,123 Z",
-        "M189,123 C179,120 172,127 173,138 L179,169 C187,174 194,167 194,155 C195,143 193,131 189,123 Z"]} />
+        "M51,124 C61,120 68,127 67,139 L61,170 C53,175 46,168 46,156 C45,144 47,131 51,124 Z",
+        "M189,124 C179,120 172,127 173,139 L179,170 C187,175 194,168 194,156 C195,144 193,131 189,124 Z"]}
+        lines={["M52,132 Q50,152 55,166", "M61,129 Q60,150 61,166", "M188,132 Q190,152 185,166", "M179,129 Q180,150 179,166"]} />
       <Region id="forearms" d={[
-        "M47,175 L61,173 L56,214 C51,221 44,217 43,208 Z",
-        "M193,175 L179,173 L184,214 C189,221 196,217 197,208 Z"]} />
-      <Region id="lowerback" d={["M105,184 L135,184 L133,217 Q120,222 107,217 Z"]}
-        lines={["M114,188 L114,214", "M126,188 L126,214"]} />
+        "M47,176 L61,174 L56,215 C51,222 44,218 43,209 Z",
+        "M193,176 L179,174 L184,215 C189,222 196,218 197,209 Z"]}
+        lines={["M50,180 L48,208", "M56,179 L53,210", "M190,180 L192,208", "M184,179 L187,210"]} />
+      <Region id="lowerback" d={["M105,186 L135,186 L133,218 Q120,224 107,218 Z"]}
+        lines={["M113,189 L112,215", "M127,189 L128,215"]} />
       <Region id="glutes" d={[
-        "M98,219 C110,214 118,221 118,233 L116,253 C104,262 92,253 92,238 C92,229 94,223 98,219 Z",
-        "M142,219 C130,214 122,221 122,233 L124,253 C136,262 148,253 148,238 C148,229 146,223 142,219 Z"]} />
+        "M97,220 C110,214 119,222 118,234 L116,254 C104,263 91,254 91,238 C91,229 93,224 97,220 Z",
+        "M143,220 C130,214 121,222 122,234 L124,254 C136,263 149,254 149,238 C149,229 147,224 143,220 Z"]}
+        lines={["M100,228 Q108,238 112,250", "M96,238 Q104,246 108,254", "M140,228 Q132,238 128,250", "M144,238 Q136,246 132,254"]} />
       <Region id="hamstrings" d={[
-        "M95,261 C105,257 114,259 115,266 L112,329 C103,338 92,329 90,313 C88,295 90,275 95,261 Z",
-        "M145,261 C135,257 126,259 125,266 L128,329 C137,338 148,329 150,313 C152,295 150,275 145,261 Z"]}
-        lines={["M103,272 L101,318", "M137,272 L139,318"]} />
+        "M95,262 C105,257 114,259 115,267 L112,330 C102,339 91,330 89,314 C87,295 89,276 95,262 Z",
+        "M145,262 C135,257 126,259 125,267 L128,330 C138,339 149,330 151,314 C153,295 151,276 145,262 Z"]}
+        lines={["M98,270 Q96,300 99,322", "M107,268 Q106,300 104,324", "M142,270 Q144,300 141,322", "M133,268 Q134,300 136,324"]} />
       <Region id="calves" d={[
-        "M96,340 C104,335 110,339 109,348 L106,409 C100,416 93,409 92,396 C90,377 92,356 96,340 Z",
-        "M144,340 C136,335 130,339 131,348 L134,409 C140,416 147,409 148,396 C150,377 148,356 144,340 Z"]} />
+        "M96,340 C104,334 111,338 110,348 L107,410 C100,417 92,410 91,396 C89,377 92,355 96,340 Z",
+        "M144,340 C136,334 129,338 130,348 L133,410 C140,417 148,410 149,396 C151,377 148,355 144,340 Z"]}
+        lines={["M98,348 Q96,378 98,402", "M105,346 Q104,378 103,404", "M142,348 Q144,378 142,402", "M135,346 Q136,378 137,404"]} />
     </svg>
   );
 }
@@ -363,6 +509,8 @@ function AppInner() {
   const [templates, setTemplates] = useState([]);
   const [weights, setWeights] = useState([]);
   const [programIdx, setProgramIdx] = useState(0);
+  const [food, setFood] = useState({});
+  const [photos, setPhotos] = useState([]);
   const [settings, setSettings] = useState({ unit: 'kg', rest: 90, wInc: 2.5, rInc: 1 });
   const [restEnd, setRestEnd] = useState(null);
   const [loaded, setLoaded] = useState(false);
@@ -385,12 +533,12 @@ function AppInner() {
 
   const seen = useRef({});
   useEffect(() => { (async () => {
-    const [h, a, c, s, r, tp, wt, pg] = await Promise.all([
+    const [h, a, c, s, r, tp, wt, pg, fd, ph] = await Promise.all([
       store.get(K.history, []), store.get(K.active, null), store.get(K.custom, []),
       store.get(K.settings, { unit: 'kg', rest: 90, wInc: 2.5, rInc: 1 }), store.get(K.rest, null),
-      store.get(K.templates, []), store.get(K.weights, []), store.get(K.program, 0),
+      store.get(K.templates, []), store.get(K.weights, []), store.get(K.program, 0), store.get(K.food, {}), store.get(K.photos, []),
     ]);
-    setHistory(normHistory(h)); setActive(normActive(a)); setCustom(c); setSettings(s); setRestEnd(r); setTemplates(normTemplates(tp)); setWeights(wt); setProgramIdx(typeof pg === 'number' ? pg : 0); setLoaded(true);
+    setHistory(normHistory(h)); setActive(normActive(a)); setCustom(c); setSettings(s); setRestEnd(r); setTemplates(normTemplates(tp)); setWeights(wt); setProgramIdx(typeof pg === 'number' ? pg : 0); setFood(fd || {}); setPhotos(ph || []); setLoaded(true);
     store.set(K.schema, 2); // data-shape version marker for future migrations
   })(); }, []);
 
@@ -418,6 +566,8 @@ function AppInner() {
       make(K.templates, setTemplates, [], normTemplates),
       make(K.weights, setWeights, []),
       make(K.program, (v) => setProgramIdx(typeof v === 'number' ? v : 0), 0),
+      make(K.food, (v) => setFood(v || {}), {}),
+      make(K.photos, (v) => setPhotos(v || []), []),
     ].filter(Boolean);
     return () => subs.forEach(u => u && u());
   }, [loaded]);
@@ -428,6 +578,8 @@ function AppInner() {
   useEffect(() => { if (loaded) { seen.current[K.templates] = JSON.stringify(templates); store.set(K.templates, templates); } }, [templates, loaded]);
   useEffect(() => { if (loaded) { seen.current[K.weights] = JSON.stringify(weights); store.set(K.weights, weights); } }, [weights, loaded]);
   useEffect(() => { if (loaded) { seen.current[K.program] = JSON.stringify(programIdx); store.set(K.program, programIdx); } }, [programIdx, loaded]);
+  useEffect(() => { if (loaded) { seen.current[K.food] = JSON.stringify(food); store.set(K.food, food); } }, [food, loaded]);
+  useEffect(() => { if (loaded) { seen.current[K.photos] = JSON.stringify(photos); store.set(K.photos, photos); } }, [photos, loaded]);
   useEffect(() => { if (loaded) { seen.current[K.settings] = JSON.stringify(settings); store.set(K.settings, settings); } }, [settings, loaded]);
   useEffect(() => { if (loaded) { seen.current[K.rest] = JSON.stringify(restEnd || null); restEnd ? store.set(K.rest, restEnd) : store.del(K.rest); } }, [restEnd, loaded]);
 
@@ -499,6 +651,14 @@ function AppInner() {
     });
     setHistory(h => [...h, done]); setActive(null); setRestEnd(null);
     setSummary({ name: done.name, dur: done.endTime - done.startTime, vol: vol(done), sets: setCount(done), prs: prNames });
+    // best-effort: attach Garmin heart-rate for the session window (works once deployed)
+    (async () => {
+      try {
+        const r = await fetch(`/api/garmin-sync?hrStart=${done.startTime}&hrEnd=${done.endTime}`);
+        if (!r.ok) return; const j = await r.json();
+        if (j && j.avgHR) setHistory(h => h.map(x => x.id === done.id ? { ...x, hr: { avg: j.avgHR, max: j.maxHR } } : x));
+      } catch (e) {}
+    })();
   };
   const cancel = () => ask('Discard this workout? All logged sets will be lost.', () => { setActive(null); setRestEnd(null); });
 
@@ -540,26 +700,27 @@ function AppInner() {
       <div style={S.viewport} key={tab} className="view-enter">
         {tab === 'body' && (
           <BodyTab heat={heat} library={library} weights={weights} unit={settings.unit} onLogWeight={() => setSheet({ type: 'weight' })}
-            onMuscle={(id) => setSheet({ type: 'muscle', region: id })}
+            onMuscle={(region, sub) => setSheet({ type: 'muscle', region, sub })}
             hasActive={!!active}
             onStart={() => active ? setTab('workout') : startWorkout()}
             onResume={() => setTab('workout')}
             active={active} />
         )}
         {tab === 'workout' && (
-          <WorkoutTab active={active} settings={settings} prevFor={prevFor} ask={ask} templates={templates} prBaseline={prBaseline} programIdx={programIdx} onStartProgram={() => { const day = PROGRAM[programIdx % PROGRAM.length]; startWorkout(day.name, day.exercises); setProgramIdx(i => (i + 1) % PROGRAM.length); }} onSkipProgram={() => setProgramIdx(i => (i + 1) % PROGRAM.length)} onSaveTemplate={() => saveTemplate(active)} onStartTemplate={(t) => startWorkout(t.name, t.exercises)} onDeleteTemplate={(id) => ask('Delete this template?', () => setTemplates(ts => ts.filter(x => x.id !== id)))}
+          <WorkoutTab active={active} settings={settings} prevFor={prevFor} ask={ask} templates={templates} prBaseline={prBaseline} programIdx={programIdx} suggestFor={(name) => suggestNext(name, history, settings.wInc)} onStartProgram={() => { const day = PROGRAM[programIdx % PROGRAM.length]; startWorkout(day.name, day.exercises); setProgramIdx(i => (i + 1) % PROGRAM.length); }} onSkipProgram={() => setProgramIdx(i => (i + 1) % PROGRAM.length)} onSaveTemplate={() => saveTemplate(active)} onStartTemplate={(t) => startWorkout(t.name, t.exercises)} onDeleteTemplate={(id) => ask('Delete this template?', () => setTemplates(ts => ts.filter(x => x.id !== id)))}
             onStart={() => startWorkout()}
             onAdd={() => setSheet({ type: 'picker' })}
             onRemoveExercise={removeExercise} onUpdateSet={updateSet}
             onAddSet={addSet} onRemoveSet={removeSet} onToggleDone={toggleDone}
             onSetType={(ei, si, t) => updateSet(ei, si, { t: t || null })}
+            onSetRpe={(ei, si, v) => updateSet(ei, si, { rpe: v || null })}
             onExNote={(ei, note) => setActive(a => { const exs = [...a.exercises]; exs[ei] = { ...exs[ei], note }; return { ...a, exercises: exs }; })}
             onRename={(n) => setActive(a => ({ ...a, name: n }))}
             onFinish={finish} onCancel={cancel}
             onOpenDetail={(ex) => setSheet({ type: 'detail', ex })} />
         )}
         {tab === 'history' && (
-          <HistoryTab history={history} weights={weights} unit={settings.unit}
+          <HistoryTab history={history} weights={weights} unit={settings.unit} photos={photos} onAddPhoto={(p) => setPhotos(ps => [...ps, p])} onDelPhoto={(id) => ask('Delete this photo?', () => setPhotos(ps => ps.filter(x => x.id !== id)))}
             onDelete={(id) => ask('Delete this workout from history?', () => setHistory(h => h.filter(w => w.id !== id)))}
             onRepeat={(w) => startWorkout(w.name, w.exercises)} />
         )}
@@ -569,14 +730,20 @@ function AppInner() {
             onNew={() => setSheet({ type: 'newExercise' })}
             onSettings={() => setSheet({ type: 'settings' })} />
         )}
-        {tab === 'garmin' && <GarminTab />}
+        {tab === 'garmin' && <GarminTab food={food} history={history} />}
+        {tab === 'food' && (
+          <FoodTab food={food} weights={weights}
+            onAdd={(d, entry) => setFood(f => ({ ...f, [d]: [...(f[d] || []), entry] }))}
+            onDel={(d, id) => setFood(f => ({ ...f, [d]: (f[d] || []).filter(x => x.id !== id) }))}
+            onTargets={(t) => setFood(f => ({ ...f, __targets: t }))} />
+        )}
       </div>
 
       <Nav tab={tab} setTab={setTab} hasActive={!!active} />
 
       {/* SHEETS */}
       {sheet?.type === 'muscle' && (
-        <MuscleSheet region={sheet.region} library={library}
+        <MuscleSheet region={sheet.region} sub={sheet.sub} library={library}
           onClose={() => setSheet(null)}
           onOpen={(ex) => setSheet({ type: 'detail', ex, from: 'muscle', region: sheet.region })}
           onStart={(metas) => { active ? addExercises(metas) : startWorkout(REGION_LABEL[sheet.region], metas); setSheet(null); }}
@@ -606,7 +773,7 @@ function AppInner() {
           onReset={() => ask('Wipe everything — history, custom exercises and settings?', () => { setHistory([]); setCustom([]); setActive(null); setRestEnd(null); setSettings({ unit: 'kg', rest: 90, wInc: 2.5, rInc: 1 }); })} />
       )}
       {sheet?.type === 'export' && (
-        <ExportSheet history={history} custom={custom} settings={settings} weights={weights} onClose={() => setSheet({ type: 'settings' })} />
+        <ExportSheet history={history} custom={custom} settings={settings} weights={weights} food={food} onClose={() => setSheet({ type: 'settings' })} />
       )}
       {sheet?.type === 'weight' && (
         <WeightSheet weights={weights} unit={settings.unit} onClose={() => setSheet(null)}
@@ -652,32 +819,74 @@ const QUOTES = [
   'Small ship, vast sea. Row anyway.',
 ];
 
-function BodyTab({ heat, weights, unit, onLogWeight, onMuscle, onStart, hasActive }) {
+function BodyTab({ heat, library, weights, unit, onLogWeight, onMuscle, onStart, hasActive }) {
   const latest = weights[weights.length - 1];
   const prevW = weights[weights.length - 2];
   const delta = latest && prevW ? latest.v - prevW.v : null;
   const [view, setView] = useState('front');
+  const [zoomR, setZoomR] = useState(null);
+  const lastFocus = useRef({ y: 200, s: 2 });
+  const focus = zoomR ? (FOCUS[zoomR] || { y: 200, s: 2 }) : null;
+  if (focus) lastFocus.current = focus;
+  const shown = focus || lastFocus.current;
+  const subs = zoomR ? (SUBREGIONS[zoomR] || []) : [];
+  const countFor = (t) => library.filter(e => e.m === zoomR && t(e.n.toLowerCase())).length;
+  const allCount = zoomR ? library.filter(e => e.m === zoomR).length : 0;
+
   return (
     <div style={{ padding: '20px 18px 12px' }}>
       <div style={S.h1}>Body</div>
 
-      <div style={{ display: 'flex', justifyContent: 'center', margin: '14px auto 4px', width: 'fit-content', background: T.surfaceHi, borderRadius: 10, padding: 3 }}>
-        {['front', 'back'].map(v => (
-          <button key={v} onClick={() => setView(v)} style={{ ...S.segBtn, background: view === v ? T.gold : 'transparent', color: view === v ? '#000' : T.textDim }}>
-            {v === 'front' ? 'Front' : 'Back'}
-          </button>
-        ))}
-      </div>
+      {!zoomR && (
+        <div style={{ display: 'flex', justifyContent: 'center', margin: '14px auto 4px', width: 'fit-content', background: T.surfaceHi, borderRadius: 10, padding: 3 }}>
+          {['front', 'back'].map(v => (
+            <button key={v} onClick={() => setView(v)} style={{ ...S.segBtn, background: view === v ? T.gold : 'transparent', color: view === v ? '#000' : T.textDim }}>
+              {v === 'front' ? 'Front' : 'Back'}
+            </button>
+          ))}
+        </div>
+      )}
 
-      <div style={{ perspective: 1200 }}>
-        <div style={{ position: 'relative', height: 'min(46vh, 400px)', transformStyle: 'preserve-3d', transition: 'transform .6s cubic-bezier(.35,.7,.25,1)', transform: view === 'back' ? 'rotateY(180deg)' : 'rotateY(0deg)' }}>
-          <div style={{ position: 'absolute', inset: 0, backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden', pointerEvents: view === 'front' ? 'auto' : 'none' }}>
-            <BodyMap view="front" heat={heat} onSelect={onMuscle} />
+      <div style={{ perspective: 1200, position: 'relative' }}>
+        <div style={{ position: 'relative', height: 'min(46vh, 400px)', transformStyle: 'preserve-3d', transition: 'transform .6s cubic-bezier(.35,.7,.25,1)', transform: view === 'back' ? 'rotateY(180deg)' : 'rotateY(0deg)', overflow: zoomR ? 'hidden' : 'visible' }}>
+          <div style={{ position: 'absolute', inset: 0, backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden', pointerEvents: view === 'front' && !zoomR ? 'auto' : 'none' }}>
+            <div style={{ height: '100%', transform: focus && view === 'front' ? `scale(${shown.s})` : 'scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .55s cubic-bezier(.3,.85,.3,1)' }}>
+              <BodyMap view="front" heat={heat} selected={zoomR} onSelect={(id) => setZoomR(id)} />
+            </div>
           </div>
-          <div style={{ position: 'absolute', inset: 0, backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden', transform: 'rotateY(180deg)', pointerEvents: view === 'back' ? 'auto' : 'none' }}>
-            <BodyMap view="back" heat={heat} onSelect={onMuscle} />
+          <div style={{ position: 'absolute', inset: 0, backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden', transform: 'rotateY(180deg)', pointerEvents: view === 'back' && !zoomR ? 'auto' : 'none' }}>
+            <div style={{ height: '100%', transform: focus && view === 'back' ? `scale(${shown.s})` : 'scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .55s cubic-bezier(.3,.85,.3,1)' }}>
+              <BodyMap view="back" heat={heat} selected={zoomR} onSelect={(id) => setZoomR(id)} />
+            </div>
           </div>
         </div>
+
+        {zoomR && (
+          <div className="slide-up" style={{ position: 'absolute', left: 4, right: 4, bottom: 4, background: 'rgba(9,9,12,0.93)', backdropFilter: 'blur(10px)', border: `1px solid ${T.borderHi}`, borderRadius: 16, padding: '12px 12px 12px', zIndex: 5 }}>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{ flex: 1, fontWeight: 800, fontSize: 15 }}>{REGION_LABEL[zoomR]}</div>
+              <button onClick={() => setZoomR(null)} style={{ ...S.iconBtn, color: T.textMute }} aria-label="Zoom out"><X size={16} /></button>
+            </div>
+            {subs.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+                {subs.map(sub => {
+                  const c = countFor(sub.test);
+                  if (!c) return null;
+                  return (
+                    <button key={sub.id} onClick={() => onMuscle(zoomR, { label: sub.label, testSrc: sub.id })}
+                      style={{ background: T.surfaceHi, border: `1px solid ${T.borderHi}`, borderRadius: 10, padding: '9px 12px', color: T.text, fontSize: 12.5, fontWeight: 700, cursor: 'pointer', fontFamily: FB }}>
+                      {sub.label} <span style={{ color: T.textMute, fontWeight: 600 }}>· {c}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            <button style={{ ...S.primaryBtn, padding: '12px' }} onClick={() => onMuscle(zoomR, null)}>
+              All {REGION_LABEL[zoomR]} exercises · {allCount}
+            </button>
+            <div style={{ fontSize: 9.5, color: T.textMute, letterSpacing: 0.8, marginTop: 8, textAlign: 'center' }}>FIBRE DIRECTION SHOWN ON THE MODEL</div>
+          </div>
+        )}
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, margin: '8px 0 16px', fontSize: 10, color: T.textMute, letterSpacing: 0.5 }}>
@@ -700,12 +909,9 @@ function BodyTab({ heat, weights, unit, onLogWeight, onMuscle, onStart, hasActiv
   );
 }
 
-/* ════════════════════════════════════════════════════════════════
-   WORKOUT TAB
-═══════════════════════════════════════════════════════════════════ */
 const PROGRAM = [{"name":"Push Day A","exercises":[{"n":"Barbell Bench Press - Medium Grip","m":"chest","sm":["shoulders","triceps"],"eq":"Barbell","a":"presshoriz","i":"Lie back on a flat bench.","img":"Barbell_Bench_Press_-_Medium_Grip"},{"n":"Standing Military Press","m":"shoulders","sm":["triceps"],"eq":"Barbell","a":"pressvert","i":"Start by placing a barbell that is about chest high on a squat rack.","img":"Standing_Military_Press"},{"n":"Incline Dumbbell Press","m":"chest","sm":["shoulders","triceps"],"eq":"Dumbbell","a":"presshoriz","i":"Lie back on an incline bench with a dumbbell in each hand atop your thighs.","img":"Incline_Dumbbell_Press"},{"n":"Side Lateral Raise","m":"shoulders","sm":[],"eq":"Dumbbell","a":"lateralraise","i":"Pick a couple of dumbbells and stand with a straight torso and the dumbbells by your side at arms length with the palms of the hand facing you.","img":"Side_Lateral_Raise"},{"n":"Triceps Pushdown","m":"triceps","sm":[],"eq":"Cable","a":"extension","i":"Attach a straight or angled bar to a high pulley and grab with an overhand grip (palms facing down) at shoulder width.","img":"Triceps_Pushdown"}]},{"name":"Pull Day A","exercises":[{"n":"Barbell Deadlift","m":"lowerback","sm":["calves","forearms","glutes","hamstrings","back","back","quads","traps"],"eq":"Barbell","a":"hinge","i":"Stand in front of a loaded barbell.","img":"Barbell_Deadlift"},{"n":"Pullups","m":"back","sm":["biceps","back"],"eq":"Bodyweight","a":"pullvert","i":"Grab the pull-up bar with the palms facing forward using the prescribed grip.","img":"Pullups"},{"n":"Bent Over Barbell Row","m":"back","sm":["biceps","back","shoulders"],"eq":"Barbell","a":"pullhoriz","i":"Holding a barbell with a pronated grip (palms facing down), bend your knees slightly and bring your torso forward, by bending at the waist, while keeping the back…","img":"Bent_Over_Barbell_Row"},{"n":"Face Pull","m":"shoulders","sm":["back"],"eq":"Cable","a":"rearfly","i":"Facing a high pulley with a rope or dual handles attached, pull the weight directly towards your face, separating your hands as you do so.","img":"Face_Pull"},{"n":"Barbell Curl","m":"biceps","sm":["forearms"],"eq":"Barbell","a":"curl","i":"Stand up with your torso upright while holding a barbell at a shoulder-width grip.","img":"Barbell_Curl"}]},{"name":"Leg Day A","exercises":[{"n":"Barbell Full Squat","m":"quads","sm":["calves","glutes","hamstrings","lowerback"],"eq":"Barbell","a":"squat","i":"This exercise is best performed inside a squat rack for safety purposes.","img":"Barbell_Full_Squat"},{"n":"Romanian Deadlift","m":"hamstrings","sm":["calves","glutes","lowerback"],"eq":"Barbell","a":"hinge","i":"Put a barbell in front of you on the ground and grab it using a pronated (palms facing down) grip that a little wider than shoulder width.","img":"Romanian_Deadlift"},{"n":"Leg Press","m":"quads","sm":["calves","glutes","hamstrings"],"eq":"Machine","a":"squat","i":"Using a leg press machine, sit down on the machine and place your legs on the platform directly in front of you at a medium (shoulder width) foot stance.","img":"Leg_Press"},{"n":"Lying Leg Curls","m":"hamstrings","sm":[],"eq":"Machine","a":"legcurl","i":"Adjust the machine lever to fit your height and lie face down on the leg curl machine with the pad of the lever on the back of your legs (just a few inches under the calves).","img":"Lying_Leg_Curls"},{"n":"Standing Calf Raises","m":"calves","sm":[],"eq":"Machine","a":"calf","i":"Adjust the padded lever of the calf raise machine to fit your height.","img":"Standing_Calf_Raises"},{"n":"Crunches","m":"abs","sm":[],"eq":"Bodyweight","a":"ab","i":"Lie flat on your back with your feet flat on the ground, or resting on a bench with your knees bent at a 90 degree angle.","img":"Crunches"}]},{"name":"Push Day B","exercises":[{"n":"Seated Dumbbell Press","m":"shoulders","sm":["triceps"],"eq":"Dumbbell","a":"pressvert","i":"Grab a couple of dumbbells and sit on a military press bench or a utility bench that has a back support on it as you place the dumbbells upright on top of your thighs.","img":"Seated_Dumbbell_Press"},{"n":"Dumbbell Bench Press","m":"chest","sm":["shoulders","triceps"],"eq":"Dumbbell","a":"presshoriz","i":"Lie down on a flat bench with a dumbbell in each hand resting on top of your thighs.","img":"Dumbbell_Bench_Press"},{"n":"Cable Crossover","m":"chest","sm":["shoulders"],"eq":"Cable","a":"fly","i":"To get yourself into the starting position, place the pulleys on a high position (above your head), select the resistance to be used and hold the pulleys in each hand.","img":"Cable_Crossover"},{"n":"Front Dumbbell Raise","m":"shoulders","sm":[],"eq":"Dumbbell","a":"pressvert","i":"Pick a couple of dumbbells and stand with a straight torso and the dumbbells on front of your thighs at arms length with the palms of the hand facing your thighs.","img":"Front_Dumbbell_Raise"},{"n":"Lying Triceps Press","m":"triceps","sm":[],"eq":"EZ Bar","a":"extension","i":"Lie on a flat bench with either an e-z bar (my preference) or a straight bar placed on the floor behind your head and your feet on the floor.","img":"Lying_Triceps_Press"},{"n":"Dips - Triceps Version","m":"triceps","sm":["chest","shoulders"],"eq":"Bodyweight","a":"extension","i":"To get into the starting position, hold your body at arm's length with your arms nearly locked above the bars.","img":"Dips_-_Triceps_Version"}]},{"name":"Pull Day B","exercises":[{"n":"T-Bar Row with Handle","m":"back","sm":["biceps","back"],"eq":"Barbell","a":"pullhoriz","i":"Position a bar into a landmine or in a corner to keep it from moving.","img":"T-Bar_Row_with_Handle"},{"n":"Wide-Grip Lat Pulldown","m":"back","sm":["biceps","back","shoulders"],"eq":"Cable","a":"pullvert","i":"Sit down on a pull-down machine with a wide bar attached to the top pulley.","img":"Wide-Grip_Lat_Pulldown"},{"n":"Seated Cable Rows","m":"back","sm":["biceps","back","shoulders"],"eq":"Cable","a":"pullhoriz","i":"For this exercise you will need access to a low pulley row machine with a V-bar.","img":"Seated_Cable_Rows"},{"n":"Barbell Shrug","m":"traps","sm":[],"eq":"Barbell","a":"shrug","i":"Stand up straight with your feet at shoulder width as you hold a barbell with both hands in front of you using a pronated grip (palms facing the thighs).","img":"Barbell_Shrug"},{"n":"Hammer Curls","m":"biceps","sm":[],"eq":"Dumbbell","a":"curl","i":"Stand up with your torso upright and a dumbbell on each hand being held at arms length.","img":"Hammer_Curls"}]},{"name":"Leg Day B","exercises":[{"n":"Front Barbell Squat","m":"quads","sm":["calves","glutes","hamstrings"],"eq":"Barbell","a":"squat","i":"This exercise is best performed inside a squat rack for safety purposes.","img":"Front_Barbell_Squat"},{"n":"Barbell Lunge","m":"quads","sm":["calves","glutes","hamstrings"],"eq":"Barbell","a":"lunge","i":"This exercise is best performed inside a squat rack for safety purposes.","img":"Barbell_Lunge"},{"n":"Leg Extensions","m":"quads","sm":[],"eq":"Machine","a":"legext","i":"For this exercise you will need to use a leg extension machine.","img":"Leg_Extensions"},{"n":"Seated Leg Curl","m":"hamstrings","sm":[],"eq":"Machine","a":"legcurl","i":"Adjust the machine lever to fit your height and sit on the machine with your back against the back support pad.","img":"Seated_Leg_Curl"},{"n":"Seated Calf Raise","m":"calves","sm":[],"eq":"Machine","a":"calf","i":"Sit on the machine and place your toes on the lower portion of the platform provided with the heels extending off.","img":"Seated_Calf_Raise"},{"n":"Hanging Leg Raise","m":"abs","sm":[],"eq":"Bodyweight","a":"ab","i":"Hang from a chin-up bar with both arms extended at arms length in top of you using either a wide grip or a medium grip.","img":"Hanging_Leg_Raise"}]}];
 
-function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, programIdx, onStartProgram, onSkipProgram, onSaveTemplate, onStartTemplate, onDeleteTemplate, onStart, onAdd, onRemoveExercise, onUpdateSet, onAddSet, onRemoveSet, onSetType, onExNote, onToggleDone, onRename, onFinish, onCancel, onOpenDetail }) {
+function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, programIdx, suggestFor, onStartProgram, onSkipProgram, onSaveTemplate, onStartTemplate, onDeleteTemplate, onStart, onAdd, onRemoveExercise, onUpdateSet, onAddSet, onRemoveSet, onSetType, onSetRpe, onExNote, onToggleDone, onRename, onFinish, onCancel, onOpenDetail }) {
   const [typeTarget, setTypeTarget] = useState(null);
   if (!active) {
     return (
@@ -758,7 +964,7 @@ function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, pro
 
       <div style={{ padding: '0 12px', display: 'flex', flexDirection: 'column', gap: 12, marginTop: 4 }}>
         {(active.exercises || []).map((ex, ei) => (
-          <ActiveExercise key={ex.key} ex={ex} settings={settings} prev={prevFor(ex.n)} prBase={prBaseline(ex.n)}
+          <ActiveExercise key={ex.key} ex={ex} settings={settings} prev={prevFor(ex.n)} prBase={prBaseline(ex.n)} suggestion={suggestFor(ex.n)}
             onOpenDetail={() => onOpenDetail(ex)}
             onRemove={() => ask(`Remove ${ex.n} from this workout?`, () => onRemoveExercise(ei))}
             onUpdateSet={(si, p) => onUpdateSet(ei, si, p)}
@@ -773,6 +979,7 @@ function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, pro
         <SaveTemplateBtn onSave={onSaveTemplate} />
         <SetTypeDialog target={typeTarget}
           onPick={(t) => { if (typeTarget) onSetType(typeTarget.ei, typeTarget.si, t); setTypeTarget(null); }}
+          onRpe={(v) => { if (typeTarget) onSetRpe(typeTarget.ei, typeTarget.si, v); setTypeTarget(null); }}
           onDelete={() => { if (typeTarget) onRemoveSet(typeTarget.ei, typeTarget.si); setTypeTarget(null); }}
           onClose={() => setTypeTarget(null)} />
       </div>
@@ -801,7 +1008,7 @@ function Stat({ label, value, unit }) {
   );
 }
 
-function ActiveExercise({ ex, settings, prev, prBase, onOpenDetail, onRemove, onUpdateSet, onAddSet, onNumTap, onNote, onToggle }) {
+function ActiveExercise({ ex, settings, prev, prBase, suggestion, onOpenDetail, onRemove, onUpdateSet, onAddSet, onNumTap, onNote, onToggle }) {
   const [menu, setMenu] = useState(false);
   const [showAnim, setShowAnim] = useState(false);
   const [editNote, setEditNote] = useState(false);
@@ -814,6 +1021,12 @@ function ActiveExercise({ ex, settings, prev, prBase, onOpenDetail, onRemove, on
         <button onClick={onOpenDetail} style={{ flex: 1, minWidth: 0, textAlign: 'left', background: 'none', border: 'none', cursor: 'pointer', padding: 0, marginLeft: 10 }}>
           <div style={{ fontWeight: 700, fontSize: 16, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ex.n}</div>
           <div style={{ fontSize: 11, color: T.textDim, marginTop: 1 }}>{REGION_LABEL[ex.m]} · {ex.eq}</div>
+          {suggestion && (
+            <span onClick={(e) => { e.stopPropagation(); const si = (ex.sets || []).findIndex(s => !s.done); if (si >= 0) onUpdateSet(si, { w: suggestion.w, r: suggestion.r }); }}
+              style={{ marginTop: 4, background: 'rgba(212,175,55,.1)', border: '1px solid rgba(212,175,55,.35)', borderRadius: 8, padding: '3px 8px', color: T.gold, fontSize: 10.5, fontWeight: 800, fontFamily: FM, cursor: 'pointer', display: 'inline-block' }}>
+              TARGET {suggestion.w} × {suggestion.r} ↵
+            </span>
+          )}
         </button>
         <button style={S.iconBtn} onClick={() => setMenu(m => !m)}><MoreHorizontal size={20} /></button>
         {menu && (<><div style={S.backdrop} onClick={() => setMenu(false)} /><div style={S.menu}>
@@ -921,7 +1134,8 @@ function RestRing({ left, total, onSkip, onAdjust }) {
 /* ════════════════════════════════════════════════════════════════
    HISTORY TAB
 ═══════════════════════════════════════════════════════════════════ */
-function HistoryTab({ history, weights, unit, onDelete, onRepeat }) {
+function HistoryTab({ history, weights, unit, photos, onAddPhoto, onDelPhoto, onDelete, onRepeat }) {
+  const [seg, setSeg] = useState('log');
   const sorted = [...history].reverse();
   const week = Date.now() - 7 * 864e5;
   const wk = history.filter(w => w.startTime >= week);
@@ -930,33 +1144,204 @@ function HistoryTab({ history, weights, unit, onDelete, onRepeat }) {
   const wkLabels = wkVols.map((_, i) => i === 7 ? 'now' : `-${7 - i}w`);
   return (
     <div style={{ padding: '20px 18px 12px' }}>
-      <div style={S.h1}>History</div>
-      <div style={S.weekCard}>
-        <div style={{ fontSize: 10, color: T.textMute, letterSpacing: 1.5, fontWeight: 700, marginBottom: 10 }}>LAST 7 DAYS</div>
-        <div style={{ display: 'flex', gap: 26 }}>
-          <Big v={wk.length} l="Sessions" />
-          <Big v={wk.reduce((s, w) => s + setCount(w), 0)} l="Sets" />
-          {(() => { const x = wk.reduce((s, w) => s + vol(w), 0); return <Big v={x >= 1000 ? Math.round(x / 1000) : Math.round(x)} suffix={x >= 1000 ? 'k' : ''} l={`${unit} volume`} />; })()}
-        </div>
+      <div style={S.h1}>Progress</div>
+      <div style={{ display: 'flex', gap: 3, margin: '12px 0 14px', background: T.surfaceHi, borderRadius: 10, padding: 3 }}>
+        {[['log', 'Log'], ['charts', 'Charts'], ['records', 'Records'], ['photos', 'Photos']].map(([k, l]) => (
+          <button key={k} onClick={() => setSeg(k)} style={{ ...S.segBtn, flex: 1, fontSize: 13, background: seg === k ? T.gold : 'transparent', color: seg === k ? '#000' : T.textDim }}>{l}</button>
+        ))}
       </div>
-      {history.length > 0 && (
-        <div style={{ ...S.weekCard, margin: '0 0 16px' }}>
-          <div style={{ fontSize: 10, color: T.textMute, letterSpacing: 1.5, fontWeight: 700, marginBottom: 8 }}>VOLUME — LAST 8 WEEKS ({unit})</div>
-          <BarsChart values={wkVols} labels={wkLabels} />
+
+      {seg === 'log' && (<>
+        <div style={S.weekCard}>
+          <div style={{ fontSize: 10, color: T.textMute, letterSpacing: 1.5, fontWeight: 700, marginBottom: 10 }}>LAST 7 DAYS</div>
+          <div style={{ display: 'flex', gap: 26 }}>
+            <Big v={wk.length} l="Sessions" />
+            <Big v={wk.reduce((s, w) => s + setCount(w), 0)} l="Sets" />
+            {(() => { const x = wk.reduce((s, w) => s + vol(w), 0); return <Big v={x >= 1000 ? Math.round(x / 1000) : Math.round(x)} suffix={x >= 1000 ? 'k' : ''} l={`${unit} volume`} />; })()}
+          </div>
         </div>
-      )}
-      {weights.length >= 2 && (
-        <div style={{ ...S.weekCard, margin: '0 0 16px' }}>
-          <div style={{ fontSize: 10, color: T.textMute, letterSpacing: 1.5, fontWeight: 700, marginBottom: 8 }}>BODY WEIGHT ({unit})</div>
-          <LineChart points={weights.slice(-30).map(x => x.v)} />
+        {!sorted.length ? (
+          <div style={S.empty}>No sessions yet.<br /><span style={{ color: T.textMute, fontSize: 13 }}>Your logged workouts appear here.</span></div>
+        ) : sorted.map(w => <HistCard key={w.id} w={w} history={history} unit={unit} onDelete={() => onDelete(w.id)} onRepeat={() => onRepeat(w)} />)}
+      </>)}
+
+      {seg === 'charts' && (<>
+        <div style={{ ...S.weekCard, margin: '0 0 14px' }}>
+          <div style={{ fontSize: 10, color: T.textMute, letterSpacing: 1.5, fontWeight: 700, marginBottom: 8 }}>WEEKLY SETS PER MUSCLE <span style={{ color: T.goldDeep }}>· 10–20 band</span></div>
+          <SetsPerMuscle history={history} />
         </div>
-      )}
-      {!sorted.length ? (
-        <div style={S.empty}>No sessions yet.<br /><span style={{ color: T.textMute, fontSize: 13 }}>Your logged workouts appear here.</span></div>
-      ) : sorted.map(w => <HistCard key={w.id} w={w} history={history} unit={unit} onDelete={() => onDelete(w.id)} onRepeat={() => onRepeat(w)} />)}
+        {history.length > 0 && (
+          <div style={{ ...S.weekCard, margin: '0 0 14px' }}>
+            <div style={{ fontSize: 10, color: T.textMute, letterSpacing: 1.5, fontWeight: 700, marginBottom: 8 }}>VOLUME — LAST 8 WEEKS ({unit})</div>
+            <BarsChart values={wkVols} labels={wkLabels} />
+          </div>
+        )}
+        <div style={{ ...S.weekCard, margin: '0 0 14px' }}>
+          <div style={{ fontSize: 10, color: T.textMute, letterSpacing: 1.5, fontWeight: 700, marginBottom: 8 }}>CONSISTENCY — LAST 12 WEEKS</div>
+          <ConsistencyCal history={history} />
+        </div>
+        {weights.length >= 2 && (
+          <div style={{ ...S.weekCard, margin: '0 0 14px' }}>
+            <div style={{ fontSize: 10, color: T.textMute, letterSpacing: 1.5, fontWeight: 700, marginBottom: 8 }}>BODY WEIGHT ({unit})</div>
+            <LineChart points={weights.slice(-30).map(x => x.v)} />
+          </div>
+        )}
+      </>)}
+
+      {seg === 'records' && <RecordsView history={history} unit={unit} />}
+      {seg === 'photos' && <PhotosView photos={photos} onAdd={onAddPhoto} onDel={onDelPhoto} />}
     </div>
   );
 }
+
+function SetsPerMuscle({ history }) {
+  const spm = setsPerMuscle(history, 7);
+  const max = 24;
+  const rows = REGIONS.map(r => ({ id: r.id, n: spm[r.id] || 0 })).filter(x => x.n > 0 || ['chest', 'back', 'shoulders', 'quads', 'hamstrings', 'biceps', 'triceps'].includes(x.id));
+  if (!rows.length) return <div style={S.empty}>Log a session to see weekly muscle volume.</div>;
+  return (
+    <div>
+      {rows.map(({ id, n }) => (
+        <div key={id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}>
+          <span style={{ width: 74, fontSize: 10.5, color: T.textDim, fontWeight: 700, letterSpacing: 0.4 }}>{REGION_LABEL[id].toUpperCase()}</span>
+          <div style={{ flex: 1, height: 12, borderRadius: 6, background: T.surfaceHi, position: 'relative', overflow: 'hidden' }}>
+            <div style={{ position: 'absolute', left: `${(10 / max) * 100}%`, width: `${(10 / max) * 100}%`, top: 0, bottom: 0, background: 'rgba(212,175,55,.12)' }} />
+            <div style={{ height: '100%', width: `${Math.min(100, (n / max) * 100)}%`, background: n >= 10 && n <= 20 ? T.gold : n > 20 ? T.danger : T.silver, borderRadius: 6, transition: 'width .4s cubic-bezier(.3,.7,.3,1)' }} />
+          </div>
+          <span style={{ width: 22, textAlign: 'right', fontFamily: FM, fontSize: 12, fontWeight: 700, color: n >= 10 && n <= 20 ? T.gold : T.textDim }}>{n}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ConsistencyCal({ history }) {
+  const days = trainedDays(history);
+  const streak = weekStreak(history, 3);
+  const cells = [];
+  for (let wk = 11; wk >= 0; wk--) { const col = []; for (let d = 6; d >= 0; d--) { const ds = localDateStr(wk * 7 + d); col.push({ ds, on: days.has(ds) }); } cells.push(col); }
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 3 }}>
+        {cells.map((col, i) => (
+          <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 3, flex: 1 }}>
+            {col.map((c) => <div key={c.ds} title={c.ds} style={{ aspectRatio: '1', borderRadius: 2.5, background: c.on ? T.gold : T.surfaceHi, opacity: c.on ? 0.95 : 1 }} />)}
+          </div>
+        ))}
+      </div>
+      <div style={{ fontSize: 11, color: T.textDim, marginTop: 10 }}>
+        Streak: <span style={{ color: T.gold, fontWeight: 800, fontFamily: FM }}>{streak}</span> week{streak === 1 ? '' : 's'} at 3+ sessions · {days.size} training days total
+      </div>
+    </div>
+  );
+}
+
+function RecordsView({ history, unit }) {
+  const [q, setQ] = useState('');
+  const [open, setOpen] = useState(null);
+  const names = useMemo(() => {
+    const last = {}; (history || []).forEach(w => w.exercises.forEach(ex => { last[ex.n] = w.startTime; }));
+    return Object.keys(last).sort((x, y) => last[y] - last[x]);
+  }, [history]);
+  const list = names.filter(n => n.toLowerCase().includes(q.toLowerCase())).slice(0, 30);
+  if (!names.length) return <div style={S.empty}>Records appear once you log workouts.</div>;
+  return (
+    <div>
+      <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search your exercises" style={{ ...S.search, marginBottom: 10 }} />
+      {list.map(n => {
+        const isOpen = open === n;
+        const recs = isOpen ? recordsFor(n, history) : null;
+        const buckets = isOpen ? [1, 2, 3, 5, 8, 10, 12].filter(r => recs[r]) : [];
+        const best1 = isOpen ? bestBefore(n, history) : 0;
+        return (
+          <div key={n} style={{ ...S.card, marginBottom: 8, overflow: 'hidden' }}>
+            <button onClick={() => setOpen(isOpen ? null : n)} style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '13px 14px', background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}>
+              <span style={{ flex: 1, fontSize: 14.5, fontWeight: 700, color: T.text }}>{n}</span>
+              {isOpen ? <ChevronDown size={16} color={T.textMute} /> : <ChevronRight size={16} color={T.textMute} />}
+            </button>
+            {isOpen && (
+              <div className="fade-in" style={{ padding: '0 14px 12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: T.textMute, letterSpacing: 1, fontWeight: 700, padding: '4px 0', borderBottom: `1px solid ${T.border}` }}>
+                  <span>REPS</span><span>BEST WEIGHT</span><span>WHEN</span>
+                </div>
+                {buckets.map(r => (
+                  <div key={r} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, padding: '7px 0', borderBottom: `1px solid ${T.border}` }}>
+                    <span style={{ fontFamily: FM, color: T.textDim, width: 34 }}>{r}RM</span>
+                    <span style={{ fontFamily: FM, fontWeight: 800, color: T.gold }}>{recs[r].w} {unit}</span>
+                    <span style={{ color: T.textMute, fontSize: 11.5 }}>{fmtDate(recs[r].ts)}</span>
+                  </div>
+                ))}
+                {!buckets.length && <div style={{ fontSize: 12, color: T.textMute, padding: '8px 0' }}>No working sets recorded yet.</div>}
+                {best1 > 0 && <div style={{ fontSize: 11.5, color: T.textDim, marginTop: 8 }}>Estimated 1RM: <span style={{ color: T.gold, fontFamily: FM, fontWeight: 800 }}>{Math.round(best1)} {unit}</span></div>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function PhotosView({ photos, onAdd, onDel }) {
+  const [busy, setBusy] = useState(false);
+  const [compare, setCompare] = useState(false);
+  const fileRef = useRef(null);
+  const sorted = [...(photos || [])].sort((a, b) => a.ts - b.ts);
+  const upload = async (file) => {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('upload_preset', CLOUDINARY.preset);
+      const r = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY.cloud}/image/upload`, { method: 'POST', body: fd });
+      const j = await r.json();
+      if (j && j.secure_url) onAdd({ id: uid(), ts: Date.now(), url: j.secure_url });
+    } catch (e) {}
+    setBusy(false);
+  };
+  if (!CLOUD_READY) return (
+    <div style={{ ...S.card, borderLeft: `3px solid ${T.gold}`, padding: '16px' }}>
+      <div style={{ fontWeight: 800, fontSize: 15, color: T.gold }}>Set up progress photos</div>
+      <p style={{ fontSize: 13, color: T.textDim, lineHeight: 1.65, margin: '8px 0 0' }}>
+        Uses your existing Cloudinary account (same as the wedding tracker). In the Cloudinary console:
+        Settings → Upload → Add upload preset → Signing mode: <b>Unsigned</b> → save. Then in src/App.jsx,
+        find the CLOUDINARY constant near the top and paste your cloud name and the preset name. Commit — done.
+      </p>
+    </div>
+  );
+  return (
+    <div>
+      <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: 'none' }} onChange={e => { upload(e.target.files && e.target.files[0]); e.target.value = ''; }} />
+      <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+        <button style={{ ...S.primaryBtn, padding: '12px', flex: 1 }} disabled={busy} onClick={() => fileRef.current && fileRef.current.click()}>{busy ? 'Uploading…' : 'Add photo'}</button>
+        {sorted.length >= 2 && <button style={{ ...S.ghostBtn, flex: '0 0 auto', padding: '12px 16px' }} onClick={() => setCompare(c => !c)}>{compare ? 'Grid' : 'Compare'}</button>}
+      </div>
+      {compare && sorted.length >= 2 ? (
+        <div style={{ display: 'flex', gap: 8 }}>
+          {[sorted[0], sorted[sorted.length - 1]].map((p, i) => (
+            <div key={p.id} style={{ flex: 1 }}>
+              <img src={p.url} alt="" style={{ width: '100%', borderRadius: 12, border: `1px solid ${T.border}`, display: 'block' }} />
+              <div style={{ fontSize: 10.5, color: i ? T.gold : T.textMute, textAlign: 'center', marginTop: 6, fontFamily: FM, fontWeight: 700 }}>{i ? 'NOW · ' : 'START · '}{fmtDate(p.ts)}</div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }} className="stagger">
+          {sorted.slice().reverse().map(p => (
+            <div key={p.id} style={{ position: 'relative' }}>
+              <a href={p.url} target="_blank" rel="noreferrer"><img src={p.url} alt="" loading="lazy" style={{ width: '100%', aspectRatio: '3/4', objectFit: 'cover', borderRadius: 10, border: `1px solid ${T.border}`, display: 'block' }} /></a>
+              <button onClick={() => onDel(p.id)} style={{ position: 'absolute', top: 4, right: 4, width: 22, height: 22, borderRadius: 7, background: 'rgba(0,0,0,.65)', border: 'none', color: '#fff', display: 'grid', placeItems: 'center', cursor: 'pointer' }}><X size={12} /></button>
+              <div style={{ fontSize: 9.5, color: T.textMute, marginTop: 4, fontFamily: FM }}>{fmtDate(p.ts)}</div>
+            </div>
+          ))}
+          {!sorted.length && <div style={{ gridColumn: '1/-1', ...S.empty }}>Weekly photo, same pose, same light — the mirror lies, the timeline doesn't.</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Big({ v, l, suffix }) {
   return <div><div style={{ fontFamily: FM, fontSize: 27, fontWeight: 700, letterSpacing: -1 }}>{v}{suffix && <span style={{ fontSize: 14, color: T.textDim }}>{suffix}</span>}</div><div style={{ fontSize: 11, color: T.textDim, marginTop: 3 }}>{l}</div></div>;
 }
@@ -979,7 +1364,7 @@ function HistCard({ w, history, unit, onDelete, onRepeat }) {
           <div style={{ fontSize: 16, fontWeight: 700, marginTop: 2 }}>{w.name}</div>
           <div style={{ display: 'flex', gap: 12, marginTop: 6, fontSize: 12, color: T.textDim, fontFamily: FM }}>
             <span>{w.exercises.length} ex</span><span>·</span><span>{setCount(w)} sets</span><span>·</span>
-            <span>{Math.round(vol(w)).toLocaleString()} {unit}</span><span>·</span><span>{fmtClock((w.endTime || w.startTime) - w.startTime)}</span>{prs.size > 0 && <><span>·</span><span style={{ color: T.gold, fontWeight: 700 }}>{prs.size} PR</span></>}
+            <span>{Math.round(vol(w)).toLocaleString()} {unit}</span><span>·</span><span>{fmtClock((w.endTime || w.startTime) - w.startTime)}</span>{prs.size > 0 && <><span>·</span><span style={{ color: T.gold, fontWeight: 700 }}>{prs.size} PR</span></>}{w.hr && <><span>·</span><span style={{ color: T.gold }}>♥ {w.hr.avg}</span></>}
           </div>
         </div>
         <span style={{ color: T.textMute, lineHeight: 0 }}>{open ? <ChevronDown size={18} /> : <ChevronRight size={18} />}</span>
@@ -991,7 +1376,7 @@ function HistCard({ w, history, unit, onDelete, onRepeat }) {
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><div style={{ fontSize: 14, fontWeight: 600 }}>{ex.n}</div>{prs.has(ex.n) && <span style={S.prPill}>PR</span>}</div>
               {ex.note && <div style={{ fontSize: 11.5, color: T.silver, fontStyle: 'italic', marginTop: 3 }}>{ex.note}</div>}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 5 }}>
-                {(ex.sets || []).map((s, j) => <span key={j} style={{ ...S.setPill, ...(s.t === 'W' ? { opacity: 0.55 } : {}) }}>{s.t ? s.t + ' ' : ''}{s.w || 0}×{s.r}</span>)}
+                {(ex.sets || []).map((s, j) => <span key={j} style={{ ...S.setPill, ...(s.t === 'W' ? { opacity: 0.55 } : {}) }}>{s.t ? s.t + ' ' : ''}{s.w || 0}×{s.r}{s.rpe ? <span style={{ color: T.goldDeep }}> @{s.rpe}</span> : ''}</span>)}
               </div>
             </div>
           ))}
@@ -1093,23 +1478,24 @@ function Sheet({ title, onClose, action, children }) {
   );
 }
 
-function MuscleSheet({ region, library, onClose, onOpen, onStart, hasActive }) {
+function MuscleSheet({ region, sub, library, onClose, onOpen, onStart, hasActive }) {
+  const subTest = sub ? ((SUBREGIONS[region] || []).find(x => x.id === sub.testSrc) || {}).test : null;
   const [view, setView] = useState('primary');
   const [sel, setSel] = useState({});
   const [limit, setLimit] = useState(60);
   useEffect(() => { setLimit(60); }, [view]);
-  const primary = library.filter(e => e.m === region);
+  const primary = library.filter(e => e.m === region && (!subTest || subTest(e.n.toLowerCase())));
   const secondary = library.filter(e => e.m !== region && (e.sm || []).includes(region));
-  const list = view === 'primary' ? primary : secondary;
+  const list = (view === 'primary' || subTest) ? primary : secondary;
   const count = Object.values(sel).filter(Boolean).length;
   const toggle = (e, ev) => { ev.stopPropagation(); setSel(s => ({ ...s, [e.id]: s[e.id] ? null : e })); };
   return (
-    <Sheet title={REGION_LABEL[region]} onClose={onClose}>
-      <div style={{ display: 'flex', gap: 0, margin: '4px 16px 8px', background: T.surfaceHi, borderRadius: 10, padding: 3, width: 'fit-content' }}>
+    <Sheet title={sub ? sub.label : REGION_LABEL[region]} onClose={onClose}>
+      {!subTest && <div style={{ display: 'flex', gap: 0, margin: '4px 16px 8px', background: T.surfaceHi, borderRadius: 10, padding: 3, width: 'fit-content' }}>
         {[['primary', `Primary (${primary.length})`], ['secondary', `Assists (${secondary.length})`]].map(([k, l]) => (
           <button key={k} onClick={() => setView(k)} style={{ ...S.segBtn, fontSize: 13, background: view === k ? T.gold : 'transparent', color: view === k ? '#000' : T.textDim }}>{l}</button>
         ))}
-      </div>
+      </div>}
       <div style={{ flex: 1, overflowY: 'auto', padding: '0 14px 90px' }}>
         {list.slice(0, limit).map(e => (
           <ExRow key={e.id} e={e} onClick={() => onOpen(e)}
@@ -1163,7 +1549,12 @@ function PickerSheet({ library, onClose, onPick, onNew }) {
 }
 
 function DetailSheet({ ex, unit, history, onClose, onAdd }) {
-  const best = bestBefore(ex.n, history || []);
+  const ss = sessionsFor(ex.n, history || []);
+  const last = ss[ss.length - 1];
+  const bestP = ss.reduce((b, p) => (p.v > b.v ? p : b), ss[0] || { v: 0, ts: 0 });
+  const prevBestV = ss.slice(0, -1).reduce((m, p) => Math.max(m, p.v), 0);
+  const isPRLast = !!last && (ss.length === 1 ? last.v > 0 : last.v > prevBestV);
+  const beatNeed = last && last.top && Number(last.top.r) > 0 ? Math.ceil((bestP.v / (1 + Number(last.top.r) / 30)) * 2) / 2 : null;
   return (
     <Sheet title={ex.n} onClose={onClose}
       action={onAdd ? <button style={S.sheetAction} onClick={onAdd}>Add</button> : null}>
@@ -1176,11 +1567,24 @@ function DetailSheet({ ex, unit, history, onClose, onAdd }) {
           {ex.mech && <Tag dim>{ex.mech === 'C' ? 'Compound' : 'Isolation'}</Tag>}
           {ex.lv && <Tag dim>{{ B: 'Beginner', I: 'Intermediate', E: 'Advanced' }[ex.lv] || ''}</Tag>}
         </div>
-        {best > 0 && (
-          <div style={{ ...S.weekCard, margin: '0 0 16px', padding: '12px 16px' }}>
-            <div style={S.statLabel}>BEST ESTIMATED 1RM</div>
-            <div style={{ fontFamily: FM, fontSize: 24, fontWeight: 700, marginTop: 2 }}>{Math.round(best)}<span style={{ fontSize: 13, color: T.textDim, marginLeft: 4 }}>{unit}</span></div>
-            <div style={{ fontSize: 11, color: T.textMute, marginTop: 4 }}>Epley estimate from your logged sets — weight × (1 + reps ÷ 30).</div>
+        {last && (
+          <div className="fade-in" style={{ ...S.weekCard, margin: '0 0 16px', padding: '13px 16px', ...(isPRLast ? { border: '1px solid rgba(212,175,55,.38)', background: 'rgba(212,175,55,.06)' } : {}) }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Trophy size={13} color={T.gold} />
+              <span style={{ ...S.statLabel, color: isPRLast ? T.gold : T.textMute }}>{isPRLast ? 'PR LAST SESSION' : 'LAST SESSION'}</span>
+            </div>
+            <div style={{ fontFamily: FM, fontSize: 17, fontWeight: 700, marginTop: 6 }}>
+              {last.top ? `${last.top.w || 0} × ${last.top.r}` : '—'}
+              <span style={{ fontSize: 11, color: T.textDim, marginLeft: 8, fontWeight: 500 }}>{fmtDate(last.ts)} · est. {Math.round(last.v)} {unit} 1RM</span>
+            </div>
+            {isPRLast ? (
+              <div style={{ fontSize: 12, color: T.gold, marginTop: 6, fontWeight: 600 }}>New all-time best — the bar to beat is yours now.</div>
+            ) : (
+              <div style={{ fontSize: 12, color: T.textDim, marginTop: 6, lineHeight: 1.5 }}>
+                All-time best: est. {Math.round(bestP.v)} {unit} ({fmtDate(bestP.ts)}).
+                {beatNeed && last.top ? <span style={{ color: T.gold, fontWeight: 700 }}> Beat it: {beatNeed} {unit} × {last.top.r}.</span> : null}
+              </div>
+            )}
           </div>
         )}
         {(() => { const ss = sessionsFor(ex.n, history || []); if (ss.length < 2) return null; return (
@@ -1263,13 +1667,13 @@ function SettingsSheet({ settings, setSettings, history, custom, onClose, onExpo
 
 function buildCSV(history, unit) {
   const esc = (x) => '"' + String(x).replace(/"/g, '""') + '"';
-  const rows = [['date', 'time', 'workout', 'exercise', 'muscle', 'equipment', 'set', 'type', 'weight_' + unit, 'reps', 'volume_' + unit].join(',')];
+  const rows = [['date', 'time', 'workout', 'exercise', 'muscle', 'equipment', 'set', 'type', 'rpe', 'weight_' + unit, 'reps', 'volume_' + unit].join(',')];
   history.forEach(w => {
     const d = new Date(w.startTime);
     const date = d.toISOString().slice(0, 10);
     const time = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
     w.exercises.forEach(ex => ex.sets.forEach((s, i) => {
-      rows.push([date, time, esc(w.name), esc(ex.n), REGION_LABEL[ex.m] || ex.m || '', ex.eq || '', i + 1, s.t || 'N', s.w || 0, s.r || 0, (Number(s.w) || 0) * (Number(s.r) || 0)].join(','));
+      rows.push([date, time, esc(w.name), esc(ex.n), REGION_LABEL[ex.m] || ex.m || '', ex.eq || '', i + 1, s.t || 'N', s.rpe || '', s.w || 0, s.r || 0, (Number(s.w) || 0) * (Number(s.r) || 0)].join(','));
     }));
   });
   return rows.join('\n');
@@ -1284,7 +1688,16 @@ function buildWeightsCSV(weights, unit) {
   return rows.join('\n');
 }
 
-function ExportSheet({ history, custom, settings, weights, onClose }) {
+function buildFoodCSV(food) {
+  const rows = [['date', 'food', 'kcal', 'protein_g', 'carbs_g', 'fat_g'].join(',')];
+  const esc = (x) => '"' + String(x).replace(/"/g, '""') + '"';
+  Object.keys(food || {}).filter(k => /^\d{4}/.test(k)).sort().forEach(d => {
+    (food[d] || []).forEach(e => rows.push([d, esc(e.n), Math.round(+e.kcal || 0), +e.p || 0, +e.c || 0, +e.f || 0].join(',')));
+  });
+  return rows.join('\n');
+}
+
+function ExportSheet({ history, custom, settings, weights, food, onClose }) {
   const [fmt, setFmt] = useState('csv');
   const [copied, setCopied] = useState(false);
   const taRef = useRef(null);
@@ -1292,15 +1705,17 @@ function ExportSheet({ history, custom, settings, weights, onClose }) {
     ? buildCSV(history, settings.unit)
     : fmt === 'weights'
       ? buildWeightsCSV(weights, settings.unit)
-      : JSON.stringify({ exportedAt: new Date().toISOString(), settings, customExercises: custom, history, bodyWeights: weights }, null, 2),
-  [fmt, history, custom, settings, weights]);
+      : fmt === 'food'
+        ? buildFoodCSV(food)
+        : JSON.stringify({ exportedAt: new Date().toISOString(), settings, customExercises: custom, history, bodyWeights: weights, food }, null, 2),
+  [fmt, history, custom, settings, weights, food]);
 
   const download = () => {
     try {
       const blob = new Blob([text], { type: fmt === 'json' ? 'application/json' : 'text/csv' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = (fmt === 'weights' ? 'bodyweight-' : 'gym-') + 'export-' + localDateStr(0) + '.' + (fmt === 'json' ? 'json' : 'csv');
+      a.href = url; a.download = (fmt === 'weights' ? 'bodyweight-' : fmt === 'food' ? 'food-' : 'gym-') + 'export-' + localDateStr(0) + '.' + (fmt === 'json' ? 'json' : 'csv');
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     } catch (e) {}
@@ -1316,8 +1731,8 @@ function ExportSheet({ history, custom, settings, weights, onClose }) {
   return (
     <Sheet title="Export" onClose={onClose}>
       <div style={{ padding: '8px 16px 20px', overflowY: 'auto' }}>
-        <div style={{ display: 'flex', gap: 0, background: T.surfaceHi, borderRadius: 10, padding: 3, width: 'fit-content', marginBottom: 10 }}>
-          {[['csv', 'Sets CSV'], ['weights', 'Weight CSV'], ['json', 'JSON']].map(([k, l]) => (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, background: T.surfaceHi, borderRadius: 10, padding: 3, width: 'fit-content', marginBottom: 10 }}>
+          {[['csv', 'Sets CSV'], ['weights', 'Weight CSV'], ['food', 'Food CSV'], ['json', 'JSON']].map(([k, l]) => (
             <button key={k} onClick={() => setFmt(k)} style={{ ...S.segBtn, fontSize: 13, background: fmt === k ? T.gold : 'transparent', color: fmt === k ? '#000' : T.textDim }}>{l}</button>
           ))}
         </div>
@@ -1326,7 +1741,9 @@ function ExportSheet({ history, custom, settings, weights, onClose }) {
             ? 'One row per completed set — date, workout, exercise, muscle, weight, reps, volume. Paste straight into Excel or Google Sheets.'
             : fmt === 'weights'
               ? 'Your body-weight log — one row per entry, ready for Excel.'
-              : 'Complete backup — settings, custom exercises, body weights and full history.'}
+              : fmt === 'food'
+                ? 'Your nutrition log — one row per food entry with macros.'
+                : 'Complete backup — settings, exercises, body weights, nutrition and full history.'}
         </div>
         <textarea ref={taRef} readOnly value={text} onFocus={e => e.target.select()}
           style={{ width: '100%', height: 220, background: T.surfaceHi, border: '1px solid ' + T.border, borderRadius: 12, color: T.text, fontFamily: FM, fontSize: 11, padding: 12, outline: 'none', resize: 'vertical', boxSizing: 'border-box', whiteSpace: 'pre' }} />
@@ -1400,7 +1817,7 @@ function WeightSheet({ weights, unit, onLog, onDelete, onClose }) {
   );
 }
 
-function SetTypeDialog({ target, onPick, onDelete, onClose }) {
+function SetTypeDialog({ target, onPick, onRpe, onDelete, onClose }) {
   if (!target) return null;
   const Opt = ({ label, sub, onClick, danger }) => (
     <button onClick={onClick} style={{ width: '100%', textAlign: 'left', background: T.surfaceHi, border: `1px solid ${T.border}`, borderRadius: 12, padding: '13px 14px', marginTop: 8, cursor: 'pointer', fontFamily: FB }}>
@@ -1416,6 +1833,13 @@ function SetTypeDialog({ target, onPick, onDelete, onClose }) {
         <Opt label="Warm-up · W" sub="Excluded from volume and records" onClick={() => onPick('W')} />
         <Opt label="Drop set · D" onClick={() => onPick('D')} />
         <Opt label="Failure · F" onClick={() => onPick('F')} />
+        <div style={{ ...S.statLabel, marginTop: 14 }}>RPE — HOW HARD WAS IT?</div>
+        <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+          {[6, 7, 8, 9, 10].map(v => (
+            <button key={v} onClick={() => onRpe(v)} style={{ flex: 1, padding: '10px 0', borderRadius: 10, border: `1px solid ${T.borderHi}`, background: T.surfaceHi, color: v >= 9 ? T.danger : T.gold, fontWeight: 800, fontFamily: FM, fontSize: 14, cursor: 'pointer' }}>{v}</button>
+          ))}
+          <button onClick={() => onRpe(null)} style={{ flex: 0.8, padding: '10px 0', borderRadius: 10, border: `1px solid ${T.border}`, background: 'none', color: T.textMute, fontSize: 11, fontWeight: 700, cursor: 'pointer', fontFamily: FB }}>Clear</button>
+        </div>
         <Opt label="Delete set" danger onClick={onDelete} />
       </div>
     </div>
@@ -1514,7 +1938,234 @@ function DailyBanner({ quote }) {
   );
 }
 
-function GarminTab() {
+const MACRO_KCAL = { p: 4, c: 4, f: 9 };
+const DEFAULT_TARGETS = { kcal: 2500, p: 150, c: 250, f: 70 };
+
+function MacroBar({ label, val, target, color }) {
+  const pct = Math.min(100, target > 0 ? (val / target) * 100 : 0);
+  return (
+    <div style={{ flex: 1 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: T.textMute, letterSpacing: 0.6, fontWeight: 700 }}>
+        <span>{label}</span><span style={{ fontFamily: FM }}>{Math.round(val)}/{target}g</span>
+      </div>
+      <div style={{ height: 6, borderRadius: 3, background: T.surfaceHi, marginTop: 4, overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: pct + '%', background: color, borderRadius: 3, transition: 'width .4s cubic-bezier(.3,.7,.3,1)' }} />
+      </div>
+    </div>
+  );
+}
+
+function FoodTab({ food, weights, onAdd, onDel, onTargets }) {
+  const tdee = useMemo(() => computeTDEE(food, weights), [food, weights]);
+  const [offset, setOffset] = useState(0);
+  const [adding, setAdding] = useState(false);
+  const [editTargets, setEditTargets] = useState(false);
+  const dateStr = useMemo(() => localDateStr(offset), [offset]);
+  const isToday = offset === 0;
+  const entries = food[dateStr] || [];
+  const targets = { ...DEFAULT_TARGETS, ...(food.__targets || {}) };
+  const tot = entries.reduce((a, e) => ({ kcal: a.kcal + (+e.kcal || 0), p: a.p + (+e.p || 0), c: a.c + (+e.c || 0), f: a.f + (+e.f || 0) }), { kcal: 0, p: 0, c: 0, f: 0 });
+  const left = targets.kcal - tot.kcal;
+  const r = 44, circ = 2 * Math.PI * r;
+  const pct = Math.min(1, targets.kcal > 0 ? tot.kcal / targets.kcal : 0);
+  const recents = useMemo(() => {
+    const seenN = new Set(); const out = [];
+    Object.keys(food).filter(k => /^\d{4}/.test(k)).sort().reverse().forEach(d => (food[d] || []).slice().reverse().forEach(e => {
+      if (!seenN.has(e.n) && out.length < 8) { seenN.add(e.n); out.push(e); }
+    }));
+    return out;
+  }, [food]);
+  const navBtn = { ...S.chipBtn, display: 'grid', placeItems: 'center' };
+
+  return (
+    <div style={{ padding: '20px 18px 12px' }}>
+      <div style={S.h1}>Fuel</div>
+      <div style={S.sub}>Calories and macros for the day.</div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '14px 0 12px' }}>
+        <button style={navBtn} onClick={() => setOffset(o => o + 1)} aria-label="Previous day"><ChevronLeft size={16} /></button>
+        <div style={{ flex: 1, textAlign: 'center', fontFamily: FM, fontSize: 14, fontWeight: 700, color: isToday ? T.gold : T.text }}>
+          {isToday ? 'Today' : fmtDate(new Date(dateStr + 'T12:00:00').getTime())}
+        </div>
+        <button style={{ ...navBtn, opacity: isToday ? 0.35 : 1 }} disabled={isToday} onClick={() => setOffset(o => Math.max(0, o - 1))} aria-label="Next day"><ChevronRight size={16} /></button>
+      </div>
+
+      <div style={{ ...S.weekCard, display: 'flex', alignItems: 'center', gap: 16, padding: '14px 16px', margin: '0 0 12px' }}>
+        <svg width="104" height="104" viewBox="0 0 104 104">
+          <circle cx="52" cy="52" r={r} fill="none" stroke={T.surfaceHi} strokeWidth="8" />
+          <circle cx="52" cy="52" r={r} fill="none" stroke={left < 0 ? T.danger : T.gold} strokeWidth="8" strokeLinecap="round"
+            strokeDasharray={circ} strokeDashoffset={circ * (1 - pct)} transform="rotate(-90 52 52)"
+            style={{ transition: 'stroke-dashoffset .5s cubic-bezier(.3,.7,.3,1)' }} />
+          <text x="52" y="48" textAnchor="middle" fontFamily={FM} fontSize="19" fontWeight="700" fill={T.text}>{Math.round(Math.abs(left)).toLocaleString()}</text>
+          <text x="52" y="64" textAnchor="middle" fontFamily={FM} fontSize="8.5" fill={T.textMute} letterSpacing="1">{left < 0 ? 'OVER' : 'LEFT'}</text>
+        </svg>
+        <div style={{ flex: 1 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+            <span style={{ fontFamily: FM, fontSize: 15, fontWeight: 700 }}>{Math.round(tot.kcal).toLocaleString()}<span style={{ color: T.textMute, fontSize: 11 }}> / {targets.kcal.toLocaleString()} kcal</span></span>
+            <button onClick={() => setEditTargets(true)} style={{ background: 'none', border: 'none', color: T.textMute, fontSize: 11, cursor: 'pointer', fontFamily: FB, textDecoration: 'underline' }}>Targets</button>
+          </div>
+          <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
+            <MacroBar label="PROTEIN" val={tot.p} target={targets.p} color={T.gold} />
+            <MacroBar label="CARBS" val={tot.c} target={targets.c} color={T.silver} />
+            <MacroBar label="FAT" val={tot.f} target={targets.f} color={T.goldDeep} />
+          </div>
+        </div>
+      </div>
+
+      <div style={{ ...S.weekCard, margin: '0 0 12px', padding: '11px 16px' }}>
+        <div style={S.statLabel}>ADAPTIVE TDEE</div>
+        {tdee.ready ? (
+          <div style={{ fontSize: 12.5, color: T.textDim, marginTop: 4, lineHeight: 1.55 }}>
+            Your data says you burn <span style={{ color: T.gold, fontFamily: FM, fontWeight: 800 }}>~{tdee.tdee.toLocaleString()} kcal/day</span> ·
+            weight trend <span style={{ fontFamily: FM, color: T.silver }}>{tdee.ratePerWk >= 0 ? '+' : ''}{tdee.ratePerWk.toFixed(2)} kg/wk</span> ({tdee.days} logged days)
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: T.textMute, marginTop: 4 }}>Log {tdee.needDays > 0 ? `${tdee.needDays} more full food day${tdee.needDays === 1 ? '' : 's'}` : ''}{tdee.needDays > 0 && tdee.needWs > 0 ? ' and ' : ''}{tdee.needWs > 0 ? `${tdee.needWs} more weigh-in${tdee.needWs === 1 ? '' : 's'}` : ''} to estimate your true expenditure.</div>
+        )}
+      </div>
+      <button style={{ ...S.primaryBtn, padding: '13px' }} onClick={() => setAdding(true)}>Add food</button>
+
+      <div style={{ marginTop: 14 }}>
+        {entries.length === 0 && <div style={S.empty}>Nothing logged {isToday ? 'yet today' : 'this day'}.</div>}
+        {entries.slice().reverse().map(e => (
+          <div key={e.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 2px', borderBottom: `1px solid ${T.border}` }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 14, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.n}</div>
+              <div style={{ fontSize: 11, color: T.textMute, fontFamily: FM, marginTop: 2 }}>P {e.p || 0} · C {e.c || 0} · F {e.f || 0}</div>
+            </div>
+            <span style={{ fontFamily: FM, fontWeight: 700, fontSize: 14, color: T.gold }}>{Math.round(+e.kcal || 0)}</span>
+            <button style={{ ...S.iconBtn, width: 28, height: 28, color: T.textMute }} onClick={() => onDel(dateStr, e.id)} aria-label="Delete entry"><X size={14} /></button>
+          </div>
+        ))}
+      </div>
+
+      {adding && <FoodSheet recents={recents} onSave={(entry) => { onAdd(dateStr, entry); setAdding(false); }} onClose={() => setAdding(false)} />}
+      {editTargets && <TargetSheet targets={targets} tdee={tdee} onSave={(t) => { onTargets(t); setEditTargets(false); }} onClose={() => setEditTargets(false)} />}
+    </div>
+  );
+}
+
+function NumField({ label, value, onChange, unit }) {
+  return (
+    <div style={{ flex: 1 }}>
+      <div style={S.statLabel}>{label}{unit ? ' (' + unit + ')' : ''}</div>
+      <input type="number" inputMode="decimal" value={value} onChange={e => onChange(e.target.value)} placeholder="0"
+        style={{ width: '100%', boxSizing: 'border-box', marginTop: 5, background: T.surfaceHi, border: `1px solid ${T.border}`, borderRadius: 10, color: T.text, fontFamily: FM, fontWeight: 700, padding: '11px 10px', outline: 'none', textAlign: 'center' }} />
+    </div>
+  );
+}
+
+function FoodSheet({ recents, onSave, onClose }) {
+  const [n, setN] = useState(''); const [kcal, setKcal] = useState(''); const [p, setP] = useState(''); const [c, setC] = useState(''); const [f, setF] = useState('');
+  const [results, setResults] = useState(null); const [searching, setSearching] = useState(false);
+  const [per100, setPer100] = useState(null); const [grams, setGrams] = useState('100');
+  const applyGrams = (base, g) => { const k = (+g || 0) / 100; setKcal(String(Math.round(base.kcal * k))); setP(String(Math.round(base.p * k))); setC(String(Math.round(base.c * k))); setF(String(Math.round(base.f * k))); };
+  const searchDB = async () => {
+    if (!n.trim()) return;
+    setSearching(true); setResults(null);
+    try {
+      const r = await fetch(`https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(n.trim())}&search_simple=1&action=process&json=1&page_size=8&fields=product_name,brands,nutriments`);
+      const j = await r.json();
+      const out = (j.products || []).map(pr => {
+        const nu = pr.nutriments || {};
+        return { name: [pr.product_name, pr.brands].filter(Boolean).join(' · '), kcal: +nu['energy-kcal_100g'] || 0, p: +nu.proteins_100g || 0, c: +nu.carbohydrates_100g || 0, f: +nu.fat_100g || 0 };
+      }).filter(x => x.name && x.kcal > 0).slice(0, 6);
+      setResults(out);
+    } catch (e) { setResults('err'); }
+    setSearching(false);
+  };
+  const macroKcal = Math.round((+p || 0) * MACRO_KCAL.p + (+c || 0) * MACRO_KCAL.c + (+f || 0) * MACRO_KCAL.f);
+  const finalKcal = +kcal || macroKcal;
+  const valid = n.trim() && finalKcal > 0;
+  const fill = (e) => { setN(e.n); setKcal(String(e.kcal || '')); setP(String(e.p || '')); setC(String(e.c || '')); setF(String(e.f || '')); };
+  return (
+    <Sheet title="Add food" onClose={onClose}
+      action={<button style={{ ...S.sheetAction, opacity: valid ? 1 : 0.4 }} disabled={!valid}
+        onClick={() => onSave({ id: uid(), n: n.trim(), kcal: finalKcal, p: +p || 0, c: +c || 0, f: +f || 0 })}>Save</button>}>
+      <div style={{ padding: 16, overflowY: 'auto' }}>
+        {recents.length > 0 && (
+          <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 10, WebkitOverflowScrolling: 'touch' }}>
+            {recents.map(e => (
+              <button key={e.id} onClick={() => fill(e)} style={{ flexShrink: 0, background: T.surfaceHi, border: `1px solid ${T.border}`, borderRadius: 16, padding: '7px 12px', color: T.textDim, fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: FB }}>
+                {e.n} <span style={{ color: T.gold, fontFamily: FM }}>{Math.round(+e.kcal || 0)}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        <Field label="FOOD">
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input value={n} onChange={e => setN(e.target.value)} placeholder="e.g. Paneer" style={{ ...S.search, flex: 1 }} autoFocus />
+            <button onClick={searchDB} disabled={searching} style={{ background: T.surfaceHi, border: `1px solid ${T.borderHi}`, borderRadius: 12, padding: '0 14px', color: T.gold, fontSize: 12.5, fontWeight: 800, cursor: 'pointer', fontFamily: FB, whiteSpace: 'nowrap' }}>{searching ? '…' : 'Search DB'}</button>
+          </div>
+        </Field>
+        {results === 'err' && <div style={{ fontSize: 11.5, color: T.textMute, margin: '-6px 0 10px' }}>Database unreachable (works once deployed) — enter macros manually.</div>}
+        {Array.isArray(results) && (
+          <div style={{ margin: '-6px 0 12px' }} className="fade-in">
+            {results.length === 0 && <div style={{ fontSize: 11.5, color: T.textMute }}>No matches — enter manually.</div>}
+            {results.map((r, i) => (
+              <button key={i} onClick={() => { setN(r.name.split(' · ')[0]); setPer100(r); setGrams('100'); applyGrams(r, 100); setResults(null); }}
+                style={{ width: '100%', textAlign: 'left', background: T.surfaceHi, border: `1px solid ${T.border}`, borderRadius: 10, padding: '9px 12px', marginTop: 6, cursor: 'pointer', fontFamily: FB }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.name}</div>
+                <div style={{ fontSize: 10.5, color: T.textMute, fontFamily: FM, marginTop: 2 }}>{Math.round(r.kcal)} kcal · P{Math.round(r.p)} C{Math.round(r.c)} F{Math.round(r.f)} /100g</div>
+              </button>
+            ))}
+          </div>
+        )}
+        {per100 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '-4px 0 12px' }} className="fade-in">
+            <span style={{ fontSize: 11, color: T.textDim, fontWeight: 700 }}>PORTION</span>
+            <input type="number" inputMode="decimal" value={grams} onChange={e => { setGrams(e.target.value); applyGrams(per100, e.target.value); }}
+              style={{ width: 80, background: T.surfaceHi, border: `1px solid ${T.gold}55`, borderRadius: 10, color: T.gold, fontFamily: FM, fontWeight: 800, padding: '9px 10px', outline: 'none', textAlign: 'center' }} />
+            <span style={{ fontSize: 11, color: T.textMute }}>grams — macros scale automatically</span>
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: 10 }}>
+          <NumField label="KCAL" value={kcal} onChange={setKcal} />
+          <NumField label="PROTEIN" value={p} onChange={setP} unit="g" />
+        </div>
+        <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
+          <NumField label="CARBS" value={c} onChange={setC} unit="g" />
+          <NumField label="FAT" value={f} onChange={setF} unit="g" />
+        </div>
+        {!kcal && macroKcal > 0 && (
+          <div style={{ fontSize: 11.5, color: T.textMute, marginTop: 10 }}>Calories left blank — will use <span style={{ color: T.gold, fontFamily: FM }}>{macroKcal} kcal</span> from macros (4·P + 4·C + 9·F).</div>
+        )}
+      </div>
+    </Sheet>
+  );
+}
+
+function TargetSheet({ targets, tdee, onSave, onClose }) {
+  const [kcal, setKcal] = useState(String(targets.kcal)); const [p, setP] = useState(String(targets.p)); const [c, setC] = useState(String(targets.c)); const [f, setF] = useState(String(targets.f));
+  const [rate, setRate] = useState(String(targets.rate != null ? targets.rate : -0.4));
+  const adaptive = tdee && tdee.ready ? Math.round(tdee.tdee + ((+rate || 0) * 7700) / 7) : null;
+  return (
+    <Sheet title="Daily targets" onClose={onClose}
+      action={<button style={S.sheetAction} onClick={() => onSave({ kcal: +kcal || DEFAULT_TARGETS.kcal, p: +p || 0, c: +c || 0, f: +f || 0, rate: +rate || 0 })}>Save</button>}>
+      <div style={{ padding: 16 }}>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <NumField label="CALORIES" value={kcal} onChange={setKcal} />
+          <NumField label="PROTEIN" value={p} onChange={setP} unit="g" />
+        </div>
+        <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
+          <NumField label="CARBS" value={c} onChange={setC} unit="g" />
+          <NumField label="FAT" value={f} onChange={setF} unit="g" />
+        </div>
+        <div style={{ display: 'flex', gap: 10, marginTop: 12, alignItems: 'flex-end' }}>
+          <NumField label="GOAL RATE" value={rate} onChange={setRate} unit="kg/wk" />
+          {adaptive && (
+            <button onClick={() => setKcal(String(adaptive))} style={{ flex: 1.4, background: 'rgba(212,175,55,.1)', border: '1px solid rgba(212,175,55,.4)', borderRadius: 10, padding: '11px 8px', color: T.gold, fontSize: 12, fontWeight: 800, cursor: 'pointer', fontFamily: FB }}>
+              Use adaptive: {adaptive.toLocaleString()} kcal
+            </button>
+          )}
+        </div>
+        <div style={{ fontSize: 11.5, color: T.textMute, marginTop: 12, lineHeight: 1.5 }}>Negative rate = cut, positive = bulk. The adaptive number comes from your own intake and weight-trend data. Targets sync across devices.</div>
+      </div>
+    </Sheet>
+  );
+}
+
+function GarminTab({ food, history }) {
   const quote = QUOTES[localDayIndex() % QUOTES.length]; // cycles daily at local midnight
   const [offset, setOffset] = useState(0);
   const [cache, setCache] = useState(null);
@@ -1564,15 +2215,43 @@ function GarminTab() {
     ['SLEEP SCORE', pick('sleep.score', 'sleepScore'), '/100'],
     ['BODY BATTERY', pick('bodyBattery.high', 'bodyBatteryHighestValue'), 'peak'],
     ['STRESS', pick('stress', 'averageStressLevel'), 'avg'],
+    ['FLOORS', pick('floors', 'floorsAscended'), ''],
+    ['SPO2', pick('spo2', 'averageSpo2'), '%'],
+    ['RESPIRATION', pick('respiration', 'avgWakingRespirationValue'), 'brpm'],
+    ['INTENSITY', pick('intensityMinutes'), 'min'],
   ].filter(x => x[1] !== null);
   const isToday = offset === 0;
   const navBtn = { ...S.chipBtn, display: 'grid', placeItems: 'center' };
 
   return (
     <div style={{ padding: '20px 18px 12px' }}>
-      <div style={S.h1}>Garmin</div>
-      <div style={S.sub}>Daily stats from your Garmin Connect account.</div>
+      <div style={S.h1}>Today</div>
+      <div style={S.sub}>Readiness, fuel and Fenix stats in one glance.</div>
       <DailyBanner quote={quote} />
+
+      {(() => { const rd = offset === 0 ? readinessFrom(data, history) : null; if (!rd) return null;
+        const col = rd.verdict === 'PUSH' ? T.gold : rd.verdict === 'MAINTAIN' ? T.silver : T.danger;
+        return (
+          <div className="fade-in" style={{ ...S.weekCard, margin: '12px 0 0', padding: '13px 16px', borderLeft: `3px solid ${col}` }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+              <span style={{ fontSize: 15, fontWeight: 800, color: col, letterSpacing: 1.5 }}>{rd.verdict}</span>
+              <span style={{ fontFamily: FM, fontSize: 11, color: T.textMute }}>readiness {rd.score}/100</span>
+            </div>
+            <div style={{ fontSize: 12.5, color: T.textDim, marginTop: 4 }}>{rd.reason}</div>
+          </div>);
+      })()}
+
+      {(() => { if (offset !== 0) return null;
+        const out = pick('calories', 'totalKilocalories'); if (out == null) return null;
+        const inn = (food[localDateStr(0)] || []).reduce((a, e) => a + (+e.kcal || 0), 0);
+        const bal = inn - out;
+        return (
+          <div className="fade-in" style={{ ...S.weekCard, margin: '10px 0 0', padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 14 }}>
+            <div style={{ flex: 1 }}><div style={S.statLabel}>ENERGY IN</div><div style={{ fontFamily: FM, fontSize: 17, fontWeight: 700, marginTop: 3 }}>{Math.round(inn).toLocaleString()}</div></div>
+            <div style={{ flex: 1 }}><div style={S.statLabel}>ENERGY OUT</div><div style={{ fontFamily: FM, fontSize: 17, fontWeight: 700, marginTop: 3 }}>{Math.round(out).toLocaleString()}</div></div>
+            <div style={{ flex: 1.2 }}><div style={S.statLabel}>{bal <= 0 ? 'DEFICIT' : 'SURPLUS'}</div><div style={{ fontFamily: FM, fontSize: 17, fontWeight: 800, marginTop: 3, color: bal <= 0 ? T.gold : T.silver }}>{bal <= 0 ? '−' : '+'}{Math.abs(Math.round(bal)).toLocaleString()}</div></div>
+          </div>);
+      })()}
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '16px 0 14px' }}>
         <button style={navBtn} onClick={() => setOffset(o => o + 1)} aria-label="Previous day"><ChevronLeft size={16} /></button>
@@ -1602,7 +2281,8 @@ function GarminTab() {
             This preview can't reach Garmin — live stats need the small server function included in your deployment
             package (api/garmin-sync). Once the app is on Vercel with GARMIN_EMAIL and GARMIN_PASSWORD set as
             environment variables, this tab fills with steps, resting heart rate, sleep, body battery, stress and
-            calories for any day. Full instructions are in the README.
+            calories for any day. Full instructions are in the README. Already deployed and seeing this?
+            Check Vercel → your project → Logs for the error.
           </p>
         </div>
       )}
@@ -1640,10 +2320,11 @@ function GarminTab() {
 
 function Nav({ tab, setTab, hasActive }) {
   const items = [
-    ['garmin', 'Garmin', Activity],
+    ['garmin', 'Today', Activity],
     ['body', 'Body', PersonStanding],
     ['workout', 'Workout', Dumbbell],
-    ['history', 'History', HistoryIcon],
+    ['food', 'Fuel', Flame],
+    ['history', 'Progress', HistoryIcon],
     ['library', 'Library', BookOpen],
   ];
   return (
@@ -1708,6 +2389,8 @@ function StyleTag() {
     .shimmer { background: linear-gradient(100deg, #0d0d11 40%, #17171d 50%, #0d0d11 60%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
     @keyframes sweep { to { left: 110%; } }
     .gold-sweep { position: absolute; top: 0; left: -60%; width: 60%; height: 2px; background: linear-gradient(90deg, transparent, #e9d27c, transparent); animation: sweep 1.8s ease-out .15s both; }
+    .mregion { transition: opacity .15s ease; }
+    .mregion:active { opacity: .72; }
     @media (prefers-reduced-motion: reduce) { .view-enter, .slide-up, .fade-in, .check-pop, .pop-in, .set-flash, .stagger > *, .shimmer, .gold-sweep, .pulse { animation: none !important; } }
     ::-webkit-scrollbar { width: 0; height: 0; }
   `}</style>;
