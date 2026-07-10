@@ -24,6 +24,12 @@ def usable(d):
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
+            # Block cross-site browser calls (defense-in-depth; no CORS headers are sent either)
+            origin = self.headers.get('Origin') or ''
+            host = self.headers.get('Host') or ''
+            if origin and host and origin.split('//')[-1].split('/')[0].lower() != host.lower():
+                self._send(403, {'error': 'forbidden_origin'})
+                return
             q = parse_qs(urlparse(self.path).query)
             g = get_client()
 
@@ -93,7 +99,14 @@ class handler(BaseHTTPRequestHandler):
                           'score': ((sleep.get('sleepScores') or {}).get('overall') or {}).get('value')},
             })
         except Exception as e:
-            self._send(500, {'error': str(e)})
+            import traceback
+            traceback.print_exc()  # full detail stays in Vercel logs only
+            msg = str(e)
+            for k in ('GARMIN_EMAIL', 'GARMIN_PASSWORD'):
+                v = os.environ.get(k) or ''
+                if v:
+                    msg = msg.replace(v, '[redacted]')
+            self._send(500, {'error': 'sync_failed', 'detail': msg[:180]})
 
     def _send(self, code, obj):
         body = json.dumps(obj).encode()
