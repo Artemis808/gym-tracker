@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { PersonStanding, Dumbbell, History as HistoryIcon, BookOpen, Settings as SettingsIcon, MoreHorizontal, Check, Circle, Plus, Minus, ChevronRight, ChevronDown, ChevronLeft, X, Activity, RefreshCw, Cloud, CloudOff, Anchor, Flame, Trophy } from 'lucide-react';
+import { PersonStanding, Dumbbell, History as HistoryIcon, BookOpen, Settings as SettingsIcon, MoreHorizontal, Check, Circle, Plus, Minus, ChevronRight, ChevronDown, ChevronLeft, X, Activity, RefreshCw, Cloud, CloudOff, Anchor, Flame, Trophy, Camera, Search, Play, Trash2 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getDatabase, ref as dbRef, onValue, set as dbSet, goOnline } from 'firebase/database';
 import { firebaseConfig } from './firebase.js';
@@ -105,13 +105,16 @@ if (FB_READY) {
 
 // localStorage shim (matches window.storage shape)
 const _localShim = {
-  async get(key) { const v = localStorage.getItem(key); return v == null ? null : { key, value: v }; },
-  async set(key, value) { localStorage.setItem(key, value); return { key, value }; },
+  async get(key) { try { const v = localStorage.getItem(key); return v == null ? null : { key, value: v }; } catch { return null; } },
+  async set(key, value) { try { localStorage.setItem(key, value); } catch (e) { console.warn('local storage full or blocked', e); } return { key, value }; },
   async delete(key) { localStorage.removeItem(key); return { key, deleted: true }; },
 };
 const _legacy = (typeof window !== 'undefined' && window.storage) ? window.storage : _localShim;
 
-const _fbKey = (k) => 'gymx/' + k.replace(/[:.#$\[\]/]/g, '_');
+// Optional hardening: add  dbRoot: 'gymx-<long-random-string>'  to your firebaseConfig
+// and lock DB rules to that unguessable path (see SETUP.md → Security).
+const DB_ROOT = (typeof firebaseConfig === 'object' && firebaseConfig && /^[\w-]{3,80}$/.test(firebaseConfig.dbRoot || '') ? firebaseConfig.dbRoot : 'gymx');
+const _fbKey = (k) => DB_ROOT + '/' + k.replace(/[:.#$\[\]/]/g, '_');
 
 const store = {
   async get(k, fb = null) {
@@ -350,10 +353,44 @@ function ExerciseMedia({ ex, height = 200 }) {
    recency heat, anatomical definition lines.
 ═══════════════════════════════════════════════════════════════════ */
 function heatColor(level) {
-  return ['#1c1c25', T.heat1, T.heat2, T.heat3][Math.min(3, level)];
+  return ['#4f181d', '#712329', '#a63b2a', T.heat3][Math.min(3, level)]; // rested deep-muscle red → trained gold
 }
 
-const BD = { fill: '#101016', stroke: '#2a2a34', strokeWidth: 1 };
+const BODY_D = [
+  "M106,56 L134,56 L137,76 L103,76 Z",
+  "M84,78 C82,120 86,168 97,212 L143,212 C154,168 158,120 156,78 C134,68 106,68 84,78 Z",
+  "M96,210 L144,210 C149,224 146,238 137,245 L103,245 C94,238 91,224 96,210 Z",
+  "M62,86 C46,96 41,122 44,158 L40,206 C39,220 51,226 57,216 L65,166 C69,134 70,106 62,86 Z",
+  "M178,86 C194,96 199,122 196,158 L200,206 C201,220 189,226 183,216 L175,166 C171,134 170,106 178,86 Z",
+  "M95,242 C86,300 88,362 96,420 L114,420 C115,362 116,300 117,246 Z",
+  "M145,242 C154,300 152,362 144,420 L126,420 C125,362 124,300 123,246 Z",
+];
+function DepthKit({ sfx }) {
+  return (<>
+    <defs>
+      <linearGradient id={'sheen' + sfx} x1="0" y1="0" x2="0.9" y2="1">
+        <stop offset="0" stopColor="#fff" stopOpacity="0.10" />
+        <stop offset="0.42" stopColor="#fff" stopOpacity="0.015" />
+        <stop offset="1" stopColor="#000" stopOpacity="0.32" />
+      </linearGradient>
+      <radialGradient id={'floor' + sfx}>
+        <stop offset="0" stopColor="#000" stopOpacity="0.55" /><stop offset="1" stopColor="#000" stopOpacity="0" />
+      </radialGradient>
+      <mask id={'bmask' + sfx}>
+        {BODY_D.map((d, i) => <path key={i} d={d} fill="#fff" />)}
+        <circle cx="120" cy="36" r="21" fill="#fff" />
+        <ellipse cx="44" cy="229" rx="9" ry="12" fill="#fff" /><ellipse cx="196" cy="229" rx="9" ry="12" fill="#fff" />
+        <ellipse cx="103" cy="431" rx="12" ry="8" fill="#fff" /><ellipse cx="137" cy="431" rx="12" ry="8" fill="#fff" />
+      </mask>
+    </defs>
+    <ellipse cx="120" cy="439" rx="74" ry="6" fill={'url(#floor' + sfx + ')'} />
+  </>);
+}
+function Sheen({ sfx }) {
+  return <rect x="0" y="0" width="240" height="446" fill={'url(#sheen' + sfx + ')'} mask={'url(#bmask' + sfx + ')'} style={{ pointerEvents: 'none' }} />;
+}
+
+const BD = { fill: '#1d1114', stroke: '#3a1b1f', strokeWidth: 1 };
 function BodyBase() {
   return (<g {...BD}>
     <circle cx="120" cy="36" r="21" />
@@ -412,16 +449,16 @@ function BodyMap({ view, heat, onSelect, selected }) {
   const Region = ({ id, d, lines }) => {
     const sel = selected === id;
     return (
-      <g className="mregion" onClick={() => onSelect(id)} style={{ cursor: 'pointer' }} role="button" aria-label={REGION_LABEL[id]}>
-        {d.map((p, i) => <path key={i} d={p} fill={fillFor(id)} stroke={sel ? T.gold : '#31313c'} strokeWidth={sel ? 2.2 : 1} style={{ transition: 'fill .3s ease, stroke .3s ease', filter: sel ? 'drop-shadow(0 0 5px rgba(212,175,55,.55))' : 'none' }} />)}
-        {(lines || []).map((p, i) => <path key={'l' + i} d={p} fill="none" stroke="rgba(0,0,0,.42)" strokeWidth="1.1" strokeLinecap="round" />)}
+      <g className={'mregion' + (sel ? ' muscle-flex' : '')} onClick={() => onSelect(id)} style={{ cursor: 'pointer', opacity: selected && !sel ? 0.15 : 1, transition: 'opacity .45s ease' }} role="button" aria-label={REGION_LABEL[id]}>
+        {d.map((p, i) => <path key={i} d={p} fill={fillFor(id)} stroke={sel ? T.gold : '#4a2026'} strokeWidth={sel ? 2.2 : 1} style={{ transition: 'fill .3s ease, stroke .3s ease', filter: sel ? 'drop-shadow(0 0 5px rgba(212,175,55,.55))' : 'none' }} />)}
+        {(lines || []).map((p, i) => <path key={'l' + i} d={p} fill="none" stroke="rgba(26,5,8,.65)" strokeWidth="1.15" strokeLinecap="round" />)}
       </g>
     );
   };
 
   if (view === 'front') return (
-    <svg viewBox="0 0 240 446" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style={{ display: 'block', margin: '0 auto' }}>
-      <BodyBase />
+    <svg viewBox="0 0 240 446" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" className="breathe" style={{ display: 'block', margin: '0 auto' }}>
+      <g style={{ opacity: selected ? 0.22 : 1, transition: 'opacity .45s ease' }}><DepthKit sfx="F" /><BodyBase /></g>
       <Region id="traps" d={["M96,70 Q120,58 144,70 L150,86 Q120,73 90,86 Z"]}
         lines={["M104,70 L98,84", "M120,64 L120,80", "M136,70 L142,84"]} />
       <Region id="shoulders" d={[
@@ -455,12 +492,13 @@ function BodyMap({ view, heat, onSelect, selected }) {
         "M96,340 C104,334 111,338 110,348 L107,410 C100,417 92,410 91,396 C89,377 92,355 96,340 Z",
         "M144,340 C136,334 129,338 130,348 L133,410 C140,417 148,410 149,396 C151,377 148,355 144,340 Z"]}
         lines={["M98,348 Q96,378 98,402", "M105,346 Q104,378 103,404", "M142,348 Q144,378 142,402", "M135,346 Q136,378 137,404"]} />
+          <g style={{ opacity: selected ? 0.25 : 1, transition: 'opacity .45s ease' }}><Sheen sfx="F" /></g>
     </svg>
   );
 
   return (
-    <svg viewBox="0 0 240 446" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style={{ display: 'block', margin: '0 auto' }}>
-      <BodyBase />
+    <svg viewBox="0 0 240 446" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" className="breathe" style={{ display: 'block', margin: '0 auto' }}>
+      <g style={{ opacity: selected ? 0.22 : 1, transition: 'opacity .45s ease' }}><DepthKit sfx="B" /><BodyBase /></g>
       <Region id="traps" d={["M120,58 L152,78 L134,128 Q120,118 106,128 L88,78 Z"]}
         lines={["M120,66 L120,120", "M106,76 L116,112", "M134,76 L124,112"]} />
       <Region id="shoulders" d={[
@@ -494,6 +532,7 @@ function BodyMap({ view, heat, onSelect, selected }) {
         "M96,340 C104,334 111,338 110,348 L107,410 C100,417 92,410 91,396 C89,377 92,355 96,340 Z",
         "M144,340 C136,334 129,338 130,348 L133,410 C140,417 148,410 149,396 C151,377 148,355 144,340 Z"]}
         lines={["M98,348 Q96,378 98,402", "M105,346 Q104,378 103,404", "M142,348 Q144,378 142,402", "M135,346 Q136,378 137,404"]} />
+          <g style={{ opacity: selected ? 0.25 : 1, transition: 'opacity .45s ease' }}><Sheen sfx="B" /></g>
     </svg>
   );
 }
@@ -746,7 +785,7 @@ function AppInner() {
       {sheet?.type === 'muscle' && (
         <MuscleSheet region={sheet.region} sub={sheet.sub} library={library}
           onClose={() => setSheet(null)}
-          onOpen={(ex) => setSheet({ type: 'detail', ex, from: 'muscle', region: sheet.region })}
+          onOpen={(ex) => setSheet({ type: 'detail', ex, from: 'muscle', region: sheet.region, sub: sheet.sub })}
           onStart={(metas) => { active ? addExercises(metas) : startWorkout(REGION_LABEL[sheet.region], metas); setSheet(null); }}
           hasActive={!!active} />
       )}
@@ -761,7 +800,7 @@ function AppInner() {
       )}
       {sheet?.type === 'detail' && (
         <DetailSheet ex={sheet.ex} unit={settings.unit} history={history}
-          onClose={() => setSheet(sheet.from === 'muscle' ? { type: 'muscle', region: sheet.region } : null)}
+          onClose={() => setSheet(sheet.from === 'muscle' ? { type: 'muscle', region: sheet.region, sub: sheet.sub } : null)}
           onAdd={active ? () => { addExercises([sheet.ex]); setSheet(null); setTab('workout'); } : null} />
       )}
       {sheet?.type === 'newExercise' && (
@@ -774,7 +813,7 @@ function AppInner() {
           onClose={() => setSheet(null)}
           onExport={() => setSheet({ type: 'export' })}
           onClear={() => ask('Delete all workout history?', () => setHistory([]))}
-          onReset={() => ask('Wipe everything — history, custom exercises and settings?', () => { setHistory([]); setCustom([]); setActive(null); setRestEnd(null); setSettings({ unit: 'kg', rest: 90, wInc: 2.5, rInc: 1 }); })} />
+          onReset={() => ask('Wipe everything — history, templates, body weight, nutrition, photos, custom exercises and settings?', () => { setHistory([]); setCustom([]); setActive(null); setRestEnd(null); setTemplates([]); setWeights([]); setProgramIdx(0); setFood({}); setPhotos([]); setSettings({ unit: 'kg', rest: 90, wInc: 2.5, rInc: 1 }); })} />
       )}
       {sheet?.type === 'export' && (
         <ExportSheet history={history} custom={custom} settings={settings} weights={weights} food={food} onClose={() => setSheet({ type: 'settings' })} />
@@ -827,8 +866,25 @@ function BodyTab({ heat, library, weights, unit, onLogWeight, onMuscle, onStart,
   const latest = weights[weights.length - 1];
   const prevW = weights[weights.length - 2];
   const delta = latest && prevW ? latest.v - prevW.v : null;
-  const [view, setView] = useState('front');
+  const [deg, setDeg] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const dragRef = useRef({ x: 0, base: 0 });
+  const norm = ((deg % 360) + 360) % 360;
+  const view = norm > 90 && norm < 270 ? 'back' : 'front';
+  const snapTo = (face) => { const base = Math.round(deg / 360) * 360; setDeg(face === 'front' ? base : base + (deg >= base ? 180 : -180)); };
   const [zoomR, setZoomR] = useState(null);
+  const [zoomFace, setZoomFace] = useState(null);
+  const selectMuscle = (id) => { setZoomFace(view); setZoomR(id); setDeg(d => d + 360); }; // 360° swoosh into the muscle
+  const closeZoom = () => { setZoomR(null); setZoomFace(null); setDeg(d => d - 360); };   // reverse swoosh out
+  // Goofy idle pose cycle — flex, hop, swagger — pauses while zoomed or dragging
+  const [poseIdx, setPoseIdx] = useState(-1);
+  useEffect(() => {
+    if (zoomR) return;
+    const first = setTimeout(() => setPoseIdx(0), 2600);
+    const iv = setInterval(() => setPoseIdx(p => (p + 1) % 3), 9000);
+    return () => { clearTimeout(first); clearInterval(iv); };
+  }, [zoomR]);
+  const poseCls = poseIdx >= 0 && !zoomR && !dragging ? 'pose-' + poseIdx : '';
   const lastFocus = useRef({ y: 200, s: 2 });
   const focus = zoomR ? (FOCUS[zoomR] || { y: 200, s: 2 }) : null;
   if (focus) lastFocus.current = focus;
@@ -845,23 +901,28 @@ function BodyTab({ heat, library, weights, unit, onLogWeight, onMuscle, onStart,
       {!zoomR && (
         <div style={{ display: 'flex', justifyContent: 'center', margin: '14px auto 4px', width: 'fit-content', background: T.surfaceHi, borderRadius: 10, padding: 3 }}>
           {['front', 'back'].map(v => (
-            <button key={v} onClick={() => setView(v)} style={{ ...S.segBtn, background: view === v ? T.gold : 'transparent', color: view === v ? '#000' : T.textDim }}>
+            <button key={v} onClick={() => snapTo(v)} style={{ ...S.segBtn, background: view === v ? T.gold : 'transparent', color: view === v ? '#000' : T.textDim }}>
               {v === 'front' ? 'Front' : 'Back'}
             </button>
           ))}
         </div>
       )}
 
-      <div style={{ perspective: 1200, position: 'relative' }}>
-        <div style={{ position: 'relative', height: 'min(46vh, 400px)', transformStyle: 'preserve-3d', transition: 'transform .65s cubic-bezier(.55,.06,.25,1)', willChange: 'transform', transform: view === 'back' ? 'rotateY(180deg)' : 'rotateY(0deg)', overflow: zoomR ? 'hidden' : 'visible' }}>
+      <div className={poseCls} style={{ perspective: 1200, position: 'relative' }}>
+        <div
+          onPointerDown={(e) => { if (zoomR) return; dragRef.current = { x: e.clientX, base: deg }; setDragging(true); }}
+          onPointerMove={(e) => { if (!dragging || zoomR) return; setDeg(dragRef.current.base + (e.clientX - dragRef.current.x) * 0.55); }}
+          onPointerUp={() => { if (!dragging) return; setDragging(false); setDeg(d => Math.round(d / 180) * 180); }}
+          onPointerLeave={() => { if (!dragging) return; setDragging(false); setDeg(d => Math.round(d / 180) * 180); }}
+          style={{ position: 'relative', height: 'min(46vh, 400px)', transformStyle: 'preserve-3d', transition: dragging ? 'none' : 'transform .65s cubic-bezier(.3,.9,.3,1)', willChange: 'transform', transform: `rotateY(${deg}deg)`, overflow: zoomR ? 'hidden' : 'visible', touchAction: 'pan-y', cursor: zoomR ? 'default' : (dragging ? 'grabbing' : 'grab') }}>
           <div style={{ position: 'absolute', inset: 0, backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden', pointerEvents: view === 'front' && !zoomR ? 'auto' : 'none' }}>
-            <div style={{ height: '100%', transform: focus && view === 'front' ? `translateY(${dy}%) scale(${shown.s})` : 'translateY(0%) scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .6s cubic-bezier(.22,1,.36,1)', willChange: 'transform' }}>
-              <BodyMap view="front" heat={heat} selected={zoomR} onSelect={(id) => setZoomR(id)} />
+            <div style={{ height: '100%', transform: focus && (zoomFace || view) === 'front' ? `translateY(${dy}%) scale(${shown.s})` : 'translateY(0%) scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .6s cubic-bezier(.22,1,.36,1)', willChange: 'transform' }}>
+              <BodyMap view="front" heat={heat} selected={zoomR} onSelect={selectMuscle} />
             </div>
           </div>
           <div style={{ position: 'absolute', inset: 0, backfaceVisibility: 'hidden', WebkitBackfaceVisibility: 'hidden', transform: 'rotateY(180deg)', pointerEvents: view === 'back' && !zoomR ? 'auto' : 'none' }}>
-            <div style={{ height: '100%', transform: focus && view === 'back' ? `translateY(${dy}%) scale(${shown.s})` : 'translateY(0%) scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .6s cubic-bezier(.22,1,.36,1)', willChange: 'transform' }}>
-              <BodyMap view="back" heat={heat} selected={zoomR} onSelect={(id) => setZoomR(id)} />
+            <div style={{ height: '100%', transform: focus && (zoomFace || view) === 'back' ? `translateY(${dy}%) scale(${shown.s})` : 'translateY(0%) scale(1)', transformOrigin: `50% ${(shown.y / 446) * 100}%`, transition: 'transform .6s cubic-bezier(.22,1,.36,1)', willChange: 'transform' }}>
+              <BodyMap view="back" heat={heat} selected={zoomR} onSelect={selectMuscle} />
             </div>
           </div>
         </div>
@@ -870,7 +931,7 @@ function BodyTab({ heat, library, weights, unit, onLogWeight, onMuscle, onStart,
           <div className="slide-up" style={{ position: 'absolute', left: 4, right: 4, bottom: 4, background: 'rgba(9,9,12,0.93)', backdropFilter: 'blur(10px)', border: `1px solid ${T.borderHi}`, borderRadius: 16, padding: '12px 12px 12px', zIndex: 5 }}>
             <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
               <div style={{ flex: 1, fontWeight: 800, fontSize: 15 }}>{REGION_LABEL[zoomR]}</div>
-              <button onClick={() => setZoomR(null)} style={{ ...S.iconBtn, color: T.textMute }} aria-label="Zoom out"><X size={16} /></button>
+              <button onClick={closeZoom} style={{ ...S.iconBtn, color: T.textMute }} aria-label="Zoom out"><X size={16} /></button>
             </div>
             {subs.length > 0 && (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
@@ -934,7 +995,7 @@ function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, pro
               <button style={{ ...S.ghostBtn, flex: '0 0 auto', padding: '13px 16px' }} onClick={onSkipProgram}>Skip</button>
             </div>
           </div>); })()}
-        <button style={{ ...S.primaryBtn, marginTop: 12 }} onClick={onStart}>Start empty workout</button>
+        <button style={{ ...S.primaryBtn, marginTop: 12 }} onClick={onStart}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}><Play size={15} />Start empty workout</span></button>
         {templates.length > 0 && (<>
           <div style={S.sectionLabel}>TEMPLATES</div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -976,14 +1037,14 @@ function WorkoutTab({ active, settings, prevFor, ask, templates, prBaseline, pro
             onAddSet={() => onAddSet(ei)} onNumTap={(si) => setTypeTarget({ ei, si })} onNote={(v) => onExNote(ei, v)}
             onToggle={(si) => onToggleDone(ei, si)} />
         ))}
-        <button style={S.dashBtn} onClick={onPickBody}>+ Add exercise</button>
+        <button style={S.dashBtn} onClick={onPickBody}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}><Plus size={16} strokeWidth={3} />Add exercise</span></button>
         <button onClick={onAdd} style={{ width: '100%', background: 'none', border: 'none', color: T.textMute, fontSize: 12, fontWeight: 600, padding: '10px 0 0', cursor: 'pointer', fontFamily: FB, textDecoration: 'underline' }}>Search the full list instead</button>
         <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
-          <button style={S.ghostBtn} onClick={onCancel}>Discard</button>
-          <button style={S.finishBtn} onClick={onFinish}>Finish</button>
+          <button style={S.ghostBtn} onClick={onCancel}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}><Trash2 size={14} />Discard</span></button>
+          <button style={S.finishBtn} onClick={onFinish}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}><Check size={15} strokeWidth={3} />Finish</span></button>
         </div>
         <SaveTemplateBtn onSave={onSaveTemplate} />
-        <SetTypeDialog target={typeTarget}
+        <SetTypeDialog target={typeTarget} cur={typeTarget ? ((((active || {}).exercises || [])[typeTarget.ei] || {}).sets || [])[typeTarget.si] || null : null}
           onPick={(t) => { if (typeTarget) onSetType(typeTarget.ei, typeTarget.si, t); setTypeTarget(null); }}
           onRpe={(v) => { if (typeTarget) onSetRpe(typeTarget.ei, typeTarget.si, v); setTypeTarget(null); }}
           onDelete={() => { if (typeTarget) onRemoveSet(typeTarget.ei, typeTarget.si); setTypeTarget(null); }}
@@ -1293,6 +1354,7 @@ function PhotosView({ photos, onAdd, onDel }) {
   const [compare, setCompare] = useState(false);
   const fileRef = useRef(null);
   const sorted = [...(photos || [])].sort((a, b) => a.ts - b.ts);
+  const safeSrc = (u) => /^(https:\/\/|data:image\/)/.test(u || '') ? u : '';
   const compress = (file) => new Promise((res, rej) => {
     const img = new Image();
     img.onload = () => {
@@ -1325,14 +1387,14 @@ function PhotosView({ photos, onAdd, onDel }) {
     <div>
       <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: 'none' }} onChange={e => { upload(e.target.files && e.target.files[0]); e.target.value = ''; }} />
       <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
-        <button style={{ ...S.primaryBtn, padding: '12px', flex: 1 }} disabled={busy} onClick={() => fileRef.current && fileRef.current.click()}>{busy ? 'Uploading…' : 'Add photo'}</button>
+        <button style={{ ...S.primaryBtn, padding: '12px', flex: 1 }} disabled={busy} onClick={() => fileRef.current && fileRef.current.click()}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}><Camera size={15} />{busy ? 'Uploading…' : 'Add photo'}</span></button>
         {sorted.length >= 2 && <button style={{ ...S.ghostBtn, flex: '0 0 auto', padding: '12px 16px' }} onClick={() => setCompare(c => !c)}>{compare ? 'Grid' : 'Compare'}</button>}
       </div>
       {compare && sorted.length >= 2 ? (
         <div style={{ display: 'flex', gap: 8 }}>
           {[sorted[0], sorted[sorted.length - 1]].map((p, i) => (
             <div key={p.id} style={{ flex: 1 }}>
-              <img src={p.url} alt="" style={{ width: '100%', borderRadius: 12, border: `1px solid ${T.border}`, display: 'block' }} />
+              <img src={safeSrc(p.url)} alt="" style={{ width: '100%', borderRadius: 12, border: `1px solid ${T.border}`, display: 'block' }} />
               <div style={{ fontSize: 10.5, color: i ? T.gold : T.textMute, textAlign: 'center', marginTop: 6, fontFamily: FM, fontWeight: 700 }}>{i ? 'NOW · ' : 'START · '}{fmtDate(p.ts)}</div>
             </div>
           ))}
@@ -1341,7 +1403,8 @@ function PhotosView({ photos, onAdd, onDel }) {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }} className="stagger">
           {sorted.slice().reverse().map(p => (
             <div key={p.id} style={{ position: 'relative' }}>
-              <a href={p.url} target="_blank" rel="noreferrer"><img src={p.url} alt="" loading="lazy" style={{ width: '100%', aspectRatio: '3/4', objectFit: 'cover', borderRadius: 10, border: `1px solid ${T.border}`, display: 'block' }} /></a>
+              {(() => { const img = <img src={safeSrc(p.url)} alt="" loading="lazy" style={{ width: '100%', aspectRatio: '3/4', objectFit: 'cover', borderRadius: 10, border: `1px solid ${T.border}`, display: 'block' }} />;
+                return /^https:\/\//.test(p.url) ? <a href={p.url} target="_blank" rel="noreferrer">{img}</a> : img; })()}
               <button onClick={() => onDel(p.id)} style={{ position: 'absolute', top: 4, right: 4, width: 22, height: 22, borderRadius: 7, background: 'rgba(0,0,0,.65)', border: 'none', color: '#fff', display: 'grid', placeItems: 'center', cursor: 'pointer' }}><X size={12} /></button>
               <div style={{ fontSize: 9.5, color: T.textMute, marginTop: 4, fontFamily: FM }}>{fmtDate(p.ts)}</div>
             </div>
@@ -1479,7 +1542,7 @@ function Sheet({ title, onClose, action, children }) {
       <div style={S.sheet} className="slide-up" onClick={e => e.stopPropagation()}>
         <div style={S.sheetGrip} />
         <div style={S.sheetHead}>
-          <button style={S.sheetCancel} onClick={onClose}>Close</button>
+          <div style={{ width: 48 }}><button style={{ ...S.iconBtn, width: 34, height: 34 }} onClick={onClose} aria-label="Close"><X size={17} /></button></div>
           <div style={{ fontWeight: 700, fontSize: 16 }}>{title}</div>
           <div style={{ width: 48, textAlign: 'right' }}>{action}</div>
         </div>
@@ -1694,7 +1757,7 @@ function SettingsSheet({ settings, setSettings, history, custom, onClose, onExpo
 }
 
 function buildCSV(history, unit) {
-  const esc = (x) => '"' + String(x).replace(/"/g, '""') + '"';
+  const esc = (x) => { let v = String(x); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
   const rows = [['date', 'time', 'workout', 'exercise', 'muscle', 'equipment', 'set', 'type', 'rpe', 'weight_' + unit, 'reps', 'volume_' + unit].join(',')];
   history.forEach(w => {
     const d = new Date(w.startTime);
@@ -1718,7 +1781,7 @@ function buildWeightsCSV(weights, unit) {
 
 function buildFoodCSV(food) {
   const rows = [['date', 'food', 'kcal', 'protein_g', 'carbs_g', 'fat_g'].join(',')];
-  const esc = (x) => '"' + String(x).replace(/"/g, '""') + '"';
+  const esc = (x) => { let v = String(x); if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
   Object.keys(food || {}).filter(k => /^\d{4}/.test(k)).sort().forEach(d => {
     (food[d] || []).forEach(e => rows.push([d, esc(e.n), Math.round(+e.kcal || 0), +e.p || 0, +e.c || 0, +e.f || 0].join(',')));
   });
@@ -1845,11 +1908,11 @@ function WeightSheet({ weights, unit, onLog, onDelete, onClose }) {
   );
 }
 
-function SetTypeDialog({ target, onPick, onRpe, onDelete, onClose }) {
+function SetTypeDialog({ target, cur, onPick, onRpe, onDelete, onClose }) {
   if (!target) return null;
-  const Opt = ({ label, sub, onClick, danger }) => (
-    <button onClick={onClick} style={{ width: '100%', textAlign: 'left', background: T.surfaceHi, border: `1px solid ${T.border}`, borderRadius: 12, padding: '13px 14px', marginTop: 8, cursor: 'pointer', fontFamily: FB }}>
-      <div style={{ fontSize: 14.5, fontWeight: 700, color: danger ? T.danger : T.text }}>{label}</div>
+  const Opt = ({ label, sub, onClick, danger, active }) => (
+    <button onClick={onClick} style={{ width: '100%', textAlign: 'left', background: active ? 'rgba(212,175,55,.09)' : T.surfaceHi, border: `1px solid ${active ? T.gold : T.border}`, borderRadius: 12, padding: '13px 14px', marginTop: 8, cursor: 'pointer', fontFamily: FB }}>
+      <div style={{ fontSize: 14.5, fontWeight: 700, color: danger ? T.danger : active ? T.gold : T.text }}>{label}</div>
       {sub && <div style={{ fontSize: 11, color: T.textMute, marginTop: 2 }}>{sub}</div>}
     </button>
   );
@@ -1857,14 +1920,14 @@ function SetTypeDialog({ target, onPick, onRpe, onDelete, onClose }) {
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.72)', display: 'grid', placeItems: 'center', zIndex: 400, padding: 24 }} className="fade-in" onClick={onClose}>
       <div className="pop-in" style={{ background: T.surfaceMax, border: `1px solid ${T.borderHi}`, borderRadius: 18, padding: '18px 16px 16px', width: '100%', maxWidth: 320 }} onClick={e => e.stopPropagation()}>
         <div style={{ fontSize: 15, fontWeight: 800, textAlign: 'center' }}>Set {target.si + 1}</div>
-        <Opt label="Working set" onClick={() => onPick(null)} />
-        <Opt label="Warm-up · W" sub="Excluded from volume and records" onClick={() => onPick('W')} />
-        <Opt label="Drop set · D" onClick={() => onPick('D')} />
-        <Opt label="Failure · F" onClick={() => onPick('F')} />
+        <Opt label="Working set" active={!(cur && cur.t)} onClick={() => onPick(null)} />
+        <Opt label="Warm-up · W" sub="Excluded from volume and records" active={cur && cur.t === 'W'} onClick={() => onPick('W')} />
+        <Opt label="Drop set · D" active={cur && cur.t === 'D'} onClick={() => onPick('D')} />
+        <Opt label="Failure · F" active={cur && cur.t === 'F'} onClick={() => onPick('F')} />
         <div style={{ ...S.statLabel, marginTop: 14 }}>RPE — HOW HARD WAS IT?</div>
         <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
           {[6, 7, 8, 9, 10].map(v => (
-            <button key={v} onClick={() => onRpe(v)} style={{ flex: 1, padding: '10px 0', borderRadius: 10, border: `1px solid ${T.borderHi}`, background: T.surfaceHi, color: v >= 9 ? T.danger : T.gold, fontWeight: 800, fontFamily: FM, fontSize: 14, cursor: 'pointer' }}>{v}</button>
+            <button key={v} onClick={() => onRpe(v)} style={{ flex: 1, padding: '10px 0', borderRadius: 10, border: `1px solid ${cur && cur.rpe === v ? T.gold : T.borderHi}`, background: cur && cur.rpe === v ? T.gold : T.surfaceHi, color: cur && cur.rpe === v ? '#000' : (v >= 9 ? T.danger : T.gold), fontWeight: 800, fontFamily: FM, fontSize: 14, cursor: 'pointer' }}>{v}</button>
           ))}
           <button onClick={() => onRpe(null)} style={{ flex: 0.8, padding: '10px 0', borderRadius: 10, border: `1px solid ${T.border}`, background: 'none', color: T.textMute, fontSize: 11, fontWeight: 700, cursor: 'pointer', fontFamily: FB }}>Clear</button>
         </div>
@@ -2033,9 +2096,9 @@ function FoodTab({ food, weights, onAdd, onDel, onTargets }) {
             <button onClick={() => setEditTargets(true)} style={{ background: 'none', border: 'none', color: T.textMute, fontSize: 11, cursor: 'pointer', fontFamily: FB, textDecoration: 'underline' }}>Targets</button>
           </div>
           <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
-            <MacroBar label="PROTEIN" val={tot.p} target={targets.p} color={T.gold} />
-            <MacroBar label="CARBS" val={tot.c} target={targets.c} color={T.silver} />
-            <MacroBar label="FAT" val={tot.f} target={targets.f} color={T.goldDeep} />
+            <MacroBar label="PROTEIN" val={tot.p} target={targets.p} color="#ff5e7a" />
+            <MacroBar label="CARBS" val={tot.c} target={targets.c} color="#ffd60a" />
+            <MacroBar label="FAT" val={tot.f} target={targets.f} color="#40c8e0" />
           </div>
         </div>
       </div>
@@ -2051,7 +2114,7 @@ function FoodTab({ food, weights, onAdd, onDel, onTargets }) {
           <div style={{ fontSize: 12, color: T.textMute, marginTop: 4 }}>Log {tdee.needDays > 0 ? `${tdee.needDays} more full food day${tdee.needDays === 1 ? '' : 's'}` : ''}{tdee.needDays > 0 && tdee.needWs > 0 ? ' and ' : ''}{tdee.needWs > 0 ? `${tdee.needWs} more weigh-in${tdee.needWs === 1 ? '' : 's'}` : ''} to estimate your true expenditure.</div>
         )}
       </div>
-      <button style={{ ...S.primaryBtn, padding: '13px' }} onClick={() => setAdding(true)}>Add food</button>
+      <button style={{ ...S.primaryBtn, padding: '13px' }} onClick={() => setAdding(true)}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}><Plus size={15} strokeWidth={3} />Add food</span></button>
 
       <div style={{ marginTop: 14 }}>
         {entries.length === 0 && <div style={S.empty}>Nothing logged {isToday ? 'yet today' : 'this day'}.</div>}
@@ -2123,7 +2186,7 @@ function FoodSheet({ recents, onSave, onClose }) {
         <Field label="FOOD">
           <div style={{ display: 'flex', gap: 8 }}>
             <input value={n} onChange={e => setN(e.target.value)} placeholder="e.g. Paneer" style={{ ...S.search, flex: 1 }} autoFocus />
-            <button onClick={searchDB} disabled={searching} style={{ background: T.surfaceHi, border: `1px solid ${T.borderHi}`, borderRadius: 12, padding: '0 14px', color: T.gold, fontSize: 12.5, fontWeight: 800, cursor: 'pointer', fontFamily: FB, whiteSpace: 'nowrap' }}>{searching ? '…' : 'Search DB'}</button>
+            <button onClick={searchDB} disabled={searching} style={{ background: T.surfaceHi, border: `1px solid ${T.borderHi}`, borderRadius: 12, padding: '0 14px', color: T.gold, fontSize: 12.5, fontWeight: 800, cursor: 'pointer', fontFamily: FB, whiteSpace: 'nowrap' }}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><Search size={13} />{searching ? '…' : 'Search'}</span></button>
           </div>
         </Field>
         {results === 'err' && <div style={{ fontSize: 11.5, color: T.textMute, margin: '-6px 0 10px' }}>Database unreachable (works once deployed) — enter macros manually.</div>}
@@ -2193,6 +2256,40 @@ function TargetSheet({ targets, tdee, onSave, onClose }) {
   );
 }
 
+function ActivityRings({ move, exer, steps }) {
+  const rings = [
+    { v: move, goal: 500, col: '#fa2e55', label: 'MOVE', unit: 'KCAL', r: 52 },
+    { v: exer, goal: 30, col: '#9dfe00', label: 'EXERCISE', unit: 'MIN', r: 40 },
+    { v: steps, goal: 8000, col: '#00e5ff', label: 'STEPS', unit: '', r: 28 },
+  ].filter(x => x.v != null);
+  const [go, setGo] = useState(false);
+  useEffect(() => { const t = requestAnimationFrame(() => setGo(true)); return () => cancelAnimationFrame(t); }, []);
+  if (!rings.length) return null;
+  return (
+    <div className="fade-in" style={{ ...S.weekCard, margin: '12px 0 0', padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 16 }}>
+      <svg width="124" height="124" viewBox="0 0 124 124" style={{ flexShrink: 0 }}>
+        {rings.map(rg => { const c = 2 * Math.PI * rg.r; const p = Math.min(1, (rg.v || 0) / rg.goal);
+          return (<g key={rg.label}>
+            <circle cx="62" cy="62" r={rg.r} fill="none" stroke={rg.col + '26'} strokeWidth="9" />
+            <circle cx="62" cy="62" r={rg.r} fill="none" stroke={rg.col} strokeWidth="9" strokeLinecap="round"
+              strokeDasharray={c} strokeDashoffset={go ? c * (1 - p) : c} transform="rotate(-90 62 62)"
+              style={{ transition: 'stroke-dashoffset 1.1s cubic-bezier(.3,.8,.3,1)', filter: `drop-shadow(0 0 4px ${rg.col}66)` }} />
+          </g>); })}
+      </svg>
+      <div style={{ flex: 1, display: 'grid', gap: 9 }}>
+        {rings.map(rg => (
+          <div key={rg.label} style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 4, background: rg.col, flexShrink: 0, boxShadow: `0 0 6px ${rg.col}88`, alignSelf: 'center' }} />
+            <span style={{ fontSize: 9.5, letterSpacing: 1.2, color: T.textDim, fontWeight: 800, width: 58 }}>{rg.label}</span>
+            <span style={{ fontFamily: FM, fontWeight: 800, fontSize: 15, color: rg.col }}>{Math.round(rg.v).toLocaleString()}</span>
+            <span style={{ fontFamily: FM, fontSize: 10, color: T.textMute }}>/ {rg.goal.toLocaleString()} {rg.unit}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function GarminTab({ food, history }) {
   const quote = QUOTES[localDayIndex() % QUOTES.length]; // cycles daily at local midnight
   const [offset, setOffset] = useState(0);
@@ -2235,18 +2332,18 @@ function GarminTab({ food, history }) {
   const sleepSec = pick('sleep.seconds', 'sleepSeconds', 'sleepTimeSeconds');
   const sleepH = sleepSec ? (sleepSec / 3600).toFixed(1) : pick('sleep.hours', 'sleepHours');
   const metrics = [
-    ['STEPS', pick('steps', 'totalSteps'), ''],
-    ['RESTING HR', pick('restingHR', 'restingHeartRate'), 'bpm'],
-    ['CALORIES', pick('calories', 'totalKilocalories'), 'kcal'],
-    ['ACTIVE CAL', pick('activeCalories', 'activeKilocalories'), 'kcal'],
-    ['SLEEP', sleepH, 'h'],
-    ['SLEEP SCORE', pick('sleep.score', 'sleepScore'), '/100'],
-    ['BODY BATTERY', pick('bodyBattery.high', 'bodyBatteryHighestValue'), 'peak'],
-    ['STRESS', pick('stress', 'averageStressLevel'), 'avg'],
-    ['FLOORS', pick('floors', 'floorsAscended'), ''],
-    ['SPO2', pick('spo2', 'averageSpo2'), '%'],
-    ['RESPIRATION', pick('respiration', 'avgWakingRespirationValue'), 'brpm'],
-    ['INTENSITY', pick('intensityMinutes'), 'min'],
+    ['STEPS', pick('steps', 'totalSteps'), '', '#30d158'],
+    ['RESTING HR', pick('restingHR', 'restingHeartRate'), 'bpm', '#ff375f'],
+    ['CALORIES', pick('calories', 'totalKilocalories'), 'kcal', '#ff9f0a'],
+    ['ACTIVE CAL', pick('activeCalories', 'activeKilocalories'), 'kcal', '#fa2e55'],
+    ['SLEEP', sleepH, 'h', '#bf5af2'],
+    ['SLEEP SCORE', pick('sleep.score', 'sleepScore'), '/100', '#bf5af2'],
+    ['BODY BATTERY', pick('bodyBattery.high', 'bodyBatteryHighestValue'), 'peak', '#00e5ff'],
+    ['STRESS', pick('stress', 'averageStressLevel'), 'avg', '#ffd60a'],
+    ['FLOORS', pick('floors', 'floorsAscended'), '', '#66d4cf'],
+    ['SPO2', pick('spo2', 'averageSpo2'), '%', '#0a84ff'],
+    ['RESPIRATION', pick('respiration', 'avgWakingRespirationValue'), 'brpm', '#64d2ff'],
+    ['INTENSITY', pick('intensityMinutes'), 'min', '#9dfe00'],
   ].filter(x => x[1] !== null);
   const isToday = offset === 0;
   const navBtn = { ...S.chipBtn, display: 'grid', placeItems: 'center' };
@@ -2257,10 +2354,15 @@ function GarminTab({ food, history }) {
       <div style={S.sub}>Readiness, fuel and Fenix stats in one glance.</div>
       <DailyBanner quote={quote} />
 
+      <ActivityRings key={dateStr} move={pick('activeCalories', 'activeKilocalories')} exer={pick('intensityMinutes')} steps={pick('steps', 'totalSteps')} />
+
       {(() => { const rd = offset === 0 ? readinessFrom(data, history) : null; if (!rd) return null;
-        const col = rd.verdict === 'PUSH' ? T.gold : rd.verdict === 'MAINTAIN' ? T.silver : T.danger;
+        const col = rd.verdict === 'PUSH' ? '#30d158' : rd.verdict === 'MAINTAIN' ? '#0a84ff' : '#ff9f0a';
+        const grad = rd.verdict === 'PUSH' ? 'linear-gradient(135deg, rgba(48,209,88,.16), rgba(0,229,255,.07))'
+          : rd.verdict === 'MAINTAIN' ? 'linear-gradient(135deg, rgba(10,132,255,.15), rgba(191,90,242,.10))'
+          : 'linear-gradient(135deg, rgba(255,159,10,.15), rgba(250,17,79,.12))';
         return (
-          <div className="fade-in" style={{ ...S.weekCard, margin: '12px 0 0', padding: '13px 16px', borderLeft: `3px solid ${col}` }}>
+          <div className="fade-in" style={{ ...S.weekCard, margin: '12px 0 0', padding: '13px 16px', background: grad, border: `1px solid ${col}44` }}>
             <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
               <span style={{ fontSize: 15, fontWeight: 800, color: col, letterSpacing: 1.5 }}>{rd.verdict}</span>
               <span style={{ fontFamily: FM, fontSize: 11, color: T.textMute }}>readiness {rd.score}/100</span>
@@ -2318,10 +2420,10 @@ function GarminTab({ food, history }) {
       {status === 'ok' && metrics.length > 0 && (
         <>
           <div className="stagger" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            {metrics.map(([l, v, u]) => (
+            {metrics.map(([l, v, u, hue]) => (
               <div key={l} style={{ ...S.card, padding: '14px 14px' }}>
-                <div style={S.statLabel}>{l}</div>
-                <div style={{ fontFamily: FM, fontSize: 26, fontWeight: 700, color: T.gold, marginTop: 4, letterSpacing: -0.5 }}>
+                <div style={S.statLabel}><span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: 3, background: hue || T.gold, marginRight: 6, verticalAlign: 'middle', boxShadow: `0 0 5px ${(hue || T.gold)}77` }} />{l}</div>
+                <div style={{ fontFamily: FM, fontSize: 26, fontWeight: 700, color: hue || T.gold, marginTop: 4, letterSpacing: -0.5 }}>
                   {typeof v === 'number' ? Math.round(v).toLocaleString() : v}
                   {u && <span style={{ fontSize: 11, color: T.textDim, marginLeft: 4, fontWeight: 500 }}>{u}</span>}
                 </div>
@@ -2424,9 +2526,17 @@ function StyleTag() {
     .shimmer { background: linear-gradient(100deg, #0d0d11 40%, #17171d 50%, #0d0d11 60%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
     @keyframes sweep { to { left: 110%; } }
     .gold-sweep { position: absolute; top: 0; left: -60%; width: 60%; height: 2px; background: linear-gradient(90deg, transparent, #e9d27c, transparent); animation: sweep 1.8s ease-out .15s both; }
+    @keyframes muscleFlex { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.055); } }
+    .muscle-flex path { transform-box: fill-box; transform-origin: center; animation: muscleFlex 1.5s ease-in-out infinite; }
+    @keyframes poseFlex { 0%, 100% { transform: none; } 25% { transform: scale(1.05, 0.96); } 50% { transform: scale(0.96, 1.05) rotate(-2deg); } 75% { transform: scale(1.06, 0.95) rotate(2deg); } }
+    @keyframes poseHop { 0%, 100% { transform: none; } 30% { transform: translateY(-12px) rotate(-3deg); } 55% { transform: translateY(0) scale(1.04, 0.96); } 75% { transform: scale(0.98, 1.02); } }
+    @keyframes poseLean { 0%, 100% { transform: none; } 35% { transform: rotate(6deg) translateX(7px); } 70% { transform: rotate(-5deg) translateX(-7px); } }
+    .pose-0 { animation: poseFlex 1.7s ease-in-out; } .pose-1 { animation: poseHop 1.5s ease-in-out; } .pose-2 { animation: poseLean 1.9s ease-in-out; }
+    @keyframes breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.007); } }
+    .breathe { animation: breathe 4.5s ease-in-out infinite; transform-origin: 50% 38%; }
     .mregion { transition: opacity .15s ease; }
     .mregion:active { opacity: .72; }
-    @media (prefers-reduced-motion: reduce) { .view-enter, .slide-up, .fade-in, .check-pop, .pop-in, .set-flash, .stagger > *, .shimmer, .gold-sweep, .pulse { animation: none !important; } }
+    @media (prefers-reduced-motion: reduce) { .view-enter, .slide-up, .fade-in, .check-pop, .pop-in, .set-flash, .stagger > *, .shimmer, .gold-sweep, .pulse, .breathe, .muscle-flex path, .pose-0, .pose-1, .pose-2 { animation: none !important; } }
     ::-webkit-scrollbar { width: 0; height: 0; }
   `}</style>;
 }
